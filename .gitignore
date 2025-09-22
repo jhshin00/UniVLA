@@ -1,3 +1,10 @@
+*.png
+*.jpg
+*.mp4
+*.pt
+vla-scripts/prism-dinosiglip-224px+7b/
+*.txt
+
 # Byte-compiled / optimized / DLL files
 **/__pycache__/
 *.py[cod]

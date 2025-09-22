@@ -1,8 +1,8 @@
 absl_py==2.1.0
 accelerate==0.32.1
-braceexpand=0.1.7
-Calvin.egg==info
-calvin_env==0.0.1
+braceexpand==0.1.7
+# Calvin.egg==info  # 주석 처리
+# calvin_env==0.0.1
 git+https://github.com/moojink/dlimp_openvla
 draccus==0.8.0
 einops==0.8.1
@@ -19,7 +19,7 @@ moviepy==1.0.3
 numpy==1.26.4
 omegaconf==2.3.0
 opencv_python==4.10.0.84
-openvla==0.0.3
+# openvla==0.0.3  # 주석 처리
 packaging==24.1
 peft==0.11.1
 Pillow==11.2.1
@@ -27,7 +27,7 @@ piq==0.8.0
 pyquaternion==0.9.9
 pytorch_lightning==1.8.6
 PyYAML==6.0.1
-PyYAML==6.0.2
+# PyYAML==6.0.2
 Requests==2.32.3
 rich==14.0.0
 robosuite==1.4.1
@@ -44,3 +44,4 @@ torchvision==0.17.0
 tqdm==4.66.4
 transformers==4.40.1
 webdataset==0.2.111
+sentencepiece

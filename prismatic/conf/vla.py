@@ -90,7 +90,24 @@ class Exp_SigLIP_224px_Bridge(VLAConfig):
 
     train_strategy: str = "fsdp-full-shard"
 
+@dataclass
+class Exp_DinoSigLIP_224px_LIBERO(Exp_SigLIP_224px_Bridge):
+    vla_id: str = "prism-dinosiglip-224px+mx-libero"
+    base_vlm: Union[str, Path] = "prism-dinosiglip-224px+7b"
 
+
+    data_mix: str = "libero_combined"
+    shuffle_buffer_size: int = 16_000   
+
+    expected_world_size: int = 1
+    global_batch_size: int = 32
+    per_device_batch_size: int = 32
+
+    learning_rate: float = 2e-5
+    weight_decay: float = 0.0
+    max_grad_norm: float = 1.0
+    lr_scheduler_type: str = "constant"
+    warmup_ratio: float = 0.0
 
 
 
@@ -135,6 +152,7 @@ class VLARegistry(Enum):
 
     # Pre-training on Bridge-v2 data only
     DINOSIGLIP_224PX_MX_BRIDGE = Exp_DinoSigLIP_224px_Bridge
+    DINOSIGLIP_224PX_MX_LIBERO = Exp_DinoSigLIP_224px_LIBERO
 
     # Pre-training on Human data only
     DINOSIGLIP_224PX_MX_HUMAN = Exp_DinoSigLIP_224px_Human
