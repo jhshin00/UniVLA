@@ -15,7 +15,7 @@ from accelerate import PartialState
 
 OptimizerCallable = Callable[[Iterable], Optimizer]
 
-from genie.modules import UncontrolledDINOLatentActionModel, ControllableDINOLatentActionModel
+from genie.modules import UncontrolledDINOLatentActionModel, ControllableDINOLatentActionModel, LAPA
 import logging
 logging.basicConfig(format='%(message)s', level=logging.INFO)
 
@@ -217,3 +217,132 @@ class DINO_LAM(LightningModule):
     def configure_optimizers(self) -> Optimizer:
         optim = self.optimizer(self.parameters())
         return optim
+
+
+class LAPA_LAM(LightningModule):
+    """
+    A latent action model operates for LAPA paper
+    """
+    
+    def __init__(
+        self,
+        image_channels: int = 3,
+        # Latent action model
+        dim: int = 1024,
+        quant_dim: int = 32,
+        codebook_size: int = 8,
+        image_size: int = 224,
+        patch_size: int = 32,
+        spatial_depth: int = 8,
+        temporal_depth: int = 8,
+        dim_head: int = 64,
+        heads: int = 16,
+        code_seq_len: int = 4,
+        attn_dropout: float = 0.0,
+        ff_dropout: float = 0.0,
+        log_interval: int = 1000,
+        log_path: str = "log_imgs",
+        task_name: str = 'lam_openx',
+        stage: str = 'stage-1',
+        optimizer: OptimizerCallable = AdamW,
+        make_data_pair: bool = False,
+        stage_one_ckpt: str = None,
+    )-> None:
+        super(LAPA_LAM, self).__init__()
+        assert stage in ['stage-1', 'stage-2']
+        
+        lam = LAPA 
+        
+        self.lam = lam(
+            dim=dim,
+            quant_dim=quant_dim,
+            codebook_size=codebook_size,
+            image_size=image_size,
+            patch_size=patch_size,
+            spatial_depth=spatial_depth,
+            temporal_depth=temporal_depth,
+            dim_head=dim_head,
+            heads=heads,
+            channels=image_channels,
+            attn_dropout=attn_dropout,
+            ff_dropout=ff_dropout,
+            code_seq_len=code_seq_len,
+        )
+        
+        self.log_interval = log_interval
+        self.log_path = log_path
+        self.optimizer = optimizer
+        self.make_data_pair = make_data_pair
+        
+        self.save_hyperparameters()
+        
+        self.task_name = task_name
+        self.distributed_state = PartialState()
+        if self.distributed_state.is_main_process:
+            wandb.init(name=task_name, reinit=True)
+            
+    def shared_step(self, batch: Dict) -> Tuple:
+        # batch: keys['videos', 'task_instruction', 'action', 'dataset_names']
+        
+        recon_loss, num_unique_codes = self.lam(batch)
+        
+        
+        loss = recon_loss
+        
+        loss_logs = (
+            ("mse_loss", recon_loss),
+            ("q_loss", torch.tensor(0.0).to(recon_loss.device)),
+            ("commit_loss", torch.tensor(0.0).to(recon_loss.device)),
+            ("code_usage", num_unique_codes),
+        )
+        
+        return loss, loss_logs
+    
+    def training_step(self, batch: Dict, batch_idx: int) -> Tensor:
+        # Compute the training loss
+        loss, aux_losses = self.shared_step(batch)
+        
+        
+        # Log the training loss
+        self.log_dict(
+            {**{"train_loss": loss}, **{f"train/{k}": v for k, v in aux_losses}},
+            prog_bar=True,
+            logger=True,
+            on_step=True,
+            on_epoch=True,
+            sync_dist=True
+        )
+        
+        if self.distributed_state.is_main_process:
+            wandb.log({**{"train_loss": loss}, **{f"train/{k}": v for k, v in aux_losses}})
+        
+        return loss
+    
+    @torch.no_grad()
+    def test_step(self, batch: Dict, batch_idx: int) -> Tensor:
+        # Compute the test loss
+        loss, aux_losses = self.shared_step(batch)
+        
+        # Log the test loss
+        self.log_dict(
+            {**{"test_loss": loss}, **{f"test/{k}": v for k, v in aux_losses}},
+            prog_bar=True,
+            logger=True,
+            on_step=True,
+            on_epoch=True,
+            sync_dist=True
+        )
+        
+        return loss
+    
+    def configure_optimizers(self) -> Optimizer:
+        optim = self.optimizer(self.parameters())
+        return optim
+    
+    # def on_after_backward(self):
+    #     if self.trainer.global_step % 100 == 0:
+    #         print("--- Checking for unused parameters ---")
+    #         for name, param in self.named_parameters():
+    #             if param.grad is None:
+    #                 print(f"UNUSED PARAMETER: {name}")
+        
