@@ -1,9 +1,9 @@
-export CUDA_VISIBLE_DEVICES=1,2
+export CUDA_VISIBLE_DEVICES=1,2,3,5,6,7
 export NCCL_P2P_DISABLE=1
 export NCCL_IB_DISABLE=1
 export NCCL_DEBUG=INFO
 
-GPUS_PER_NODE=2
+GPUS_PER_NODE=6
 NNODES=1
 MASTER_PORT=${MASTER_PORT:-28596}
 MASTER_ADDR=${MASTER_ADDR:-"127.0.0.1"}
@@ -25,8 +25,8 @@ torchrun --nproc_per_node ${GPUS_PER_NODE} --nnodes ${NNODES} --node_rank ${RANK
                                     --data_root_dir "/ssd4/libero_raw" \
                                     --wandb_entity "jlee24" \
                                     --wandb_project "univla-lora-libero" \
-                                    --vla.global_batch_size 4 \
+                                    --vla.global_batch_size 6 \
                                     --vla.per_device_batch_size 1 \
-                                    --gradient_accumulation_steps 2 \
+                                    --gradient_accumulation_steps 1 \
                                     --vla.enable_mixed_precision_training true \
                                     --vla.enable_gradient_checkpointing true \
