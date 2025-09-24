@@ -21,4 +21,4 @@ torchrun --nproc_per_node ${GPUS_PER_NODE} --nnodes ${NNODES} --node_rank ${RANK
                                  --max_steps 30000 \
                                  --learning_rate 3.5e-4 \
                                  --lam_path "latent_action_model/logs/task_centric_lam_stage2/epoch=2-step=18000.ckpt" \
-                                 --hf_token ""
+                                 --hf_token 

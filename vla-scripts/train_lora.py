@@ -1,6 +1,6 @@
+#!/usr/bin/env python3
 import json
 import os
-import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional, Tuple, Union
@@ -10,40 +10,35 @@ import torch
 import torch.distributed as dist
 import torchvision.transforms as transforms
 import yaml
-from transformers import BitsAndBytesConfig
-from peft import LoraConfig, PeftModel, get_peft_model, prepare_model_for_kbit_training
+
+from peft import LoraConfig, get_peft_model, TaskType
 
 from prismatic.conf import VLAConfig, VLARegistry
-from prismatic.models import load, load_vla
+from prismatic.models import load
 from prismatic.overwatch import initialize_overwatch
 from prismatic.training import VLAMetrics, get_train_strategy
 from prismatic.util import set_global_seed
-from prismatic.vla import get_latent_vla_dataset_and_collator
 from prismatic.vla.datasets.rlds.utils.data_utils import save_dataset_statistics
 from prismatic.vla.datasets import RLDSBatchTransformLIBERO_withHis, RLDSDataset
-from prismatic.util.data_utils import PaddedCollatorForActionPrediction_LIBERO
 from prismatic.models.backbones.llm.prompting import PurePromptBuilder, VicunaV15ChatPromptBuilder
+from prismatic.vla.action_tokenizer import ActionTokenizer
+from prismatic.util.data_utils import PaddedCollatorForActionPrediction_LIBERO
 
-# Sane Defaults
+# Sane defaults
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
-
-
-# Initialize Overwatch =>> Wraps `logging.Logger`
 overwatch = initialize_overwatch(__name__)
 
 
 @dataclass
 class TrainConfig:
-    # fmt: off
-
-    # VLAConfig (`prismatic/conf/vla.py`); override with --vla.type `VLARegistry.<VLA>.vla_id`
+    # === VLA (LIBERO) 기본 설정 ===
     vla: VLAConfig = field(
         default_factory=VLAConfig.get_choice_class(VLARegistry.DINOSIGLIP_224PX_MX_LIBERO.vla_id)
     )
-    pretrain_vlm: str = 'prism-dinosiglip-224px+7b'
-    lam_path: str = "latent_action_model/logs/task_centric_lam_stage2/epoch=2-step=18000.ckpt"
+    pretrain_vlm: str = "prism-dinosiglip-224px+7b"
 
-    # LAM setting
+    # === LAM ===
+    lam_path: str = "latent_action_model/logs/task_centric_lam_stage2/epoch=2-step=18000.ckpt"
     codebook_size: int = 16
     lam_model_dim: int = 768
     lam_latent_dim: int = 128
@@ -52,280 +47,167 @@ class TrainConfig:
     lam_dec_blocks: int = 12
     lam_num_heads: int = 12
 
-    # Directory Paths
-    data_root_dir: Path = Path(                                     # Path to Open-X dataset directory
-        "/ssd1/openpi_official/datasets/libero_raw"
-    )
-    run_root_dir: Path = Path("runs")                               # Path to directory to store logs & checkpoints
-    adapter_tmp_dir: Path = Path("adapter-tmp")                     # Temporary directory for LoRA weights before fusing
+    # === 데이터/로그 경로 ===
+    data_root_dir: Path = Path("/ssd1/openpi_official/datasets/libero_raw")
+    dataset_name: str = "libero_combined"
+    run_root_dir: Path = Path("vla_log")
 
-    # Resume Run Parameters
-    pretrained_checkpoint: Optional[Path] = None                    # Absolute Path to Checkpoint
-    is_resume: bool = True                                          # Whether we are continuing a prior training run
-                                                                    #   (only applicable given pretrained checkpoint)
-    resume_step: Optional[int] = None                               # Global Step to Resume (should match checkpoint)
-    resume_epoch: Optional[int] = None                              # Epoch to Resume (should match checkpoint)
+    # === 재시작/체크포인트 ===
+    pretrained_checkpoint: Optional[Path] = None
+    is_resume: bool = False
+    resume_step: Optional[int] = None
+    resume_epoch: Optional[int] = None
 
-    # Run Arguments
-    run_id: Optional[str] = None                                    # Run ID for logging, Weights & Biases
-    run_id_note: Optional[str] = None                               # Extra note for logging, Weights & Biases
-    save_interval: int = 5000                                      # Interval for saving checkpoints (in steps)
-    image_aug: bool = True                                          # Whether to enable image augmentations
-    seed: int = 42                                                  # Random seed (for reproducibility)
+    # === 런 설정 ===
+    run_id: Optional[str] = None
+    run_id_note: Optional[str] = None
+    save_interval: int = 5000
+    image_aug: bool = True
+    seed: int = 42
 
-    # HF Hub Credentials (for any gated models)
-    hf_token: Union[str, Path] = ''                
+    # === HF Hub ===
+    hf_token: Union[str, Path] = ""
+    hf_cache_dir: Path = Path("ssd2/hf_cache")
 
-    # LoRA Arguments
-    use_lora: bool = True                                           # Whether to use LoRA fine-tuning
-    lora_rank: int = 32                                             # Rank of LoRA weight matrix
-    lora_dropout: float = 0.0                                       # Dropout applied to LoRA weights
-    use_quantization: bool = False                                  # Whether to 4-bit quantize VLA for LoRA fine-tuning
-                                                                    #   => CAUTION: Reduces memory but hurts performance
+    # === LoRA ===
+    use_lora: bool = True
+    lora_rank: int = 32
+    lora_dropout: float = 0.0
+    # (양자화는 prismatic.load 경로와 충돌 가능성 → 비활성 권장)
 
-    # LIBERO Dataset Settings
-    dataset_name: str = "libero_combined"                           # LIBERO dataset name
-    window_size: int = 12                                           # Window size for LIBERO training
-    shuffle_buffer_size: int = 16000                                # Dataloader shuffle buffer size
+    # === LIBERO dataloader ===
+    window_size: int = 12  # 8 -> 6으로 더 줄여서 메모리 사용량 감소
+    shuffle_buffer_size: int = 16000  # 8000 -> 4000으로 더 줄여서 메모리 사용량 감소
+    
+    # === 메모리 최적화 ===
+    gradient_accumulation_steps: int = 4  # gradient accumulation을 더 늘려서 effective batch size 유지
+    max_memory_usage: float = 0.8  # GPU 메모리 사용량 제한 (80%)
 
-    # Tracking Parameters
-    trackers: Tuple[str, ...] = ("jsonl", "wandb")                  # Trackers to initialize (if W&B, add config!)
-    wandb_project: str = "latent-action-pretrain-libero"            # Name of W&B project to log to (use default!)
-    wandb_entity: str = "opendrivelab"                              # Name of entity to log under
+    # === 로깅 ===
+    trackers: Tuple[str, ...] = ("jsonl", "wandb")
+    wandb_project: str = "univla-lora-libero"
+    wandb_entity: str = "jhshin406"
+
+    use_flash_attention: bool = True
+    lora_target: str = "attn"  # "attn_mlp" -> "attn"으로 변경하여 메모리 사용량 감소
+    clamp_seq_len: Optional[int] = None
 
     def __post_init__(self) -> None:
-        """Lift optimization parameters from `self.vla` for ease of use =>> validate on `expected_world_size`"""
         self.epochs = self.vla.epochs
         self.max_steps = self.vla.max_steps
         self.global_batch_size = self.vla.global_batch_size
         self.per_device_batch_size = self.vla.per_device_batch_size
-
         self.learning_rate = self.vla.learning_rate
         self.weight_decay = self.vla.weight_decay
         self.max_grad_norm = self.vla.max_grad_norm
         self.lr_scheduler_type = self.vla.lr_scheduler_type
         self.warmup_ratio = self.vla.warmup_ratio
-
         self.train_strategy = self.vla.train_strategy
-
-        # [Validate] Assert on `expected_world_size`
         assert (
             self.vla.expected_world_size == overwatch.world_size()
         ), f"Expected World Size = {self.vla.expected_world_size} but Found {overwatch.world_size()} GPUs!"
 
-    # fmt: on
 
-
-def _run_lora_training_loop(
-    train_strategy, vla_dataset, collator, action_tokenizer, metrics, 
-    save_interval, vlm, lora_config, adapter_dir, run_dir
-):
-    """Custom training loop with LoRA checkpoint saving support."""
-    from torch.utils.data import DataLoader
-    from tqdm import tqdm
-    
-    # Create DataLoader
-    dataloader = DataLoader(
-        vla_dataset,
-        batch_size=train_strategy.per_device_batch_size,
-        sampler=None,
-        collate_fn=collator,
-        num_workers=0,
-    )
-    
-    # Training loop
-    with tqdm(total=train_strategy.max_steps, leave=False) as progress:
-        train_strategy.vlm.train()
-        train_strategy.optimizer.zero_grad()
-        
-        for batch_idx, batch in enumerate(dataloader):
-            # Move batch to device
-            batch = {k: v.to(train_strategy.device_id) if isinstance(v, torch.Tensor) else v 
-                    for k, v in batch.items()}
-            
-            # Forward pass
-            with torch.autocast("cuda", dtype=torch.bfloat16):
-                output = train_strategy.vlm(**batch)
-                loss = output.loss
-            
-            # Backward pass
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(train_strategy.vlm.parameters(), max_norm=1.0)
-            
-            # Optimizer step
-            train_strategy.optimizer.step()
-            train_strategy.lr_scheduler.step()
-            train_strategy.optimizer.zero_grad()
-            
-            # Update metrics
-            epoch = (metrics.global_step + 1) // (len(vla_dataset) // train_strategy.global_batch_size)
-            metrics.commit(global_step=metrics.global_step + 1, epoch=epoch, lr=train_strategy.lr_scheduler.get_last_lr()[0])
-            status = metrics.push()
-            
-            # Save checkpoint with LoRA support
-            if (terminate := (train_strategy.max_steps is not None and metrics.global_step >= train_strategy.max_steps)) or (
-                (metrics.global_step % save_interval) == 0
-            ):
-                _save_lora_checkpoint(
-                    vlm, lora_config, adapter_dir, run_dir, 
-                    metrics.global_step, epoch, loss.item()
-                )
-                dist.barrier()
-                
-                if terminate:
-                    return
-            
-            # Update progress
-            progress.update()
-            progress.set_description(status)
-
-
-def _save_lora_checkpoint(vlm, lora_config, adapter_dir, run_dir, global_step, epoch, train_loss):
-    """Save LoRA checkpoint with merging support (similar to finetune_libero.py)."""
-    if not dist.is_initialized() or dist.get_rank() == 0:
-        print(f"Saving LoRA Checkpoint for Step {global_step}")
-        
-        # If LoRA, we first save adapter weights, then merge into full model; otherwise, default save!
-        save_dir = adapter_dir if lora_config is not None else run_dir
-        
-        # Save adapter weights
-        vlm.save_pretrained(save_dir)
-        
-        # Save merged model
-        checkpoint_dir = run_dir / "checkpoints"
-        checkpoint_path = checkpoint_dir / f"step-{global_step:06d}-epoch-{epoch:02d}-loss={train_loss:.4f}.pt"
-        
-        # Merge LoRA weights for final model
-        if lora_config is not None:
-            from peft import PeftModel
-            base_model = vlm.get_base_model() if hasattr(vlm, 'get_base_model') else vlm
-            merged_model = PeftModel.from_pretrained(base_model, adapter_dir)
-            merged_model = merged_model.merge_and_unload()
-            torch.save({"model": merged_model.state_dict()}, checkpoint_path)
-        else:
-            torch.save({"model": vlm.state_dict()}, checkpoint_path)
-        
-        print(f"Saved LoRA Checkpoint for Step {global_step} at: {checkpoint_path}")
+def _build_action_tokenizer_and_resize(vlm, codebook_size: int) -> ActionTokenizer:
+    tok = vlm.llm_backbone.get_tokenizer()
+    special_tokens = {"additional_special_tokens": [f"<ACT_{i}>" for i in range(codebook_size)]}
+    tok.add_special_tokens(special_tokens)
+    # PEFT 적용 전/후 어느 시점이든 한 번은 호출되어야 함
+    vlm.llm_backbone.llm.resize_token_embeddings(len(tok))
+    return ActionTokenizer(tok)
 
 
 @draccus.wrap()
 def train(cfg: TrainConfig) -> None:
-    overwatch.info("OpenVLA Training :: Warming Up")
-
-    # Note => Under `torchrun` initializing `overwatch` will automatically set up `torch.distributed`
+    overwatch.info("OpenVLA LoRA Pre-Training on LIBERO :: Warmup")
     torch.cuda.set_device(device_id := overwatch.local_rank())
     torch.cuda.empty_cache()
 
-    # Configure Unique Run Name & Save Directory
+    # --- Run ID 구성 ---
     vla_id = cfg.vla.vla_id
-    cfg.run_id = (
-        f"{vla_id}+n{cfg.vla.expected_world_size // 8}+b{cfg.per_device_batch_size}+x{cfg.seed}"
-        if cfg.run_id is None
-        else cfg.run_id
-    )
-    if cfg.run_id_note is not None:
-        cfg.run_id += f"--{cfg.run_id_note}"
+    run_id = f"{vla_id}+n{cfg.vla.expected_world_size // 8}+b{cfg.per_device_batch_size}+x{cfg.seed}"
+    if cfg.run_id is not None:
+        run_id = cfg.run_id
+    if cfg.run_id_note:
+        run_id += f"--{cfg.run_id_note}"
     if cfg.image_aug:
-        cfg.run_id += "--image_aug"
-
+        run_id += "--image_aug"
     if cfg.use_lora:
-        cfg.run_id += f"+lora-r{cfg.lora_rank}+dropout-{cfg.lora_dropout}"
-    if cfg.use_quantization:
-        cfg.run_id += "+q-4bit"
-    cfg.run_id += f'-LIBERO-Latent-Action-Pretraining-ws-{cfg.window_size}'
-    # Start =>> Build Directories and Set Randomness
-    overwatch.info('"Do or do not; there is no try."', ctx_level=1)
-    # hf_token = cfg.hf_token.read_text().strip() if isinstance(cfg.hf_token, Path) else os.environ[cfg.hf_token]
-    hf_token = cfg.hf_token
+        run_id += f"+lora-r{cfg.lora_rank}+dropout-{cfg.lora_dropout}"
+    run_id += f"-LIBERO-Latent-Action-Pretraining-ws-{cfg.window_size}"
+    cfg.run_id = run_id
+
+    # --- 디렉토리/시드 ---
+    run_dir = cfg.run_root_dir / cfg.run_id
+    os.makedirs(run_dir / "checkpoints", exist_ok=True)
     worker_init_fn = set_global_seed(cfg.seed, get_worker_init_fn=True)
-    os.makedirs(run_dir := (cfg.run_root_dir / cfg.run_id), exist_ok=True)
-    os.makedirs(cfg.run_root_dir / cfg.run_id / "checkpoints", exist_ok=True)
-    if cfg.use_lora:
-        os.makedirs(adapter_dir := (cfg.adapter_tmp_dir / cfg.run_id), exist_ok=True)
 
-    # Save Configuration =>> additionally save a JSON version for later HF Integration
+    # --- 설정 저장 ---
     if overwatch.is_rank_zero():
         draccus.dump(cfg, open(run_dir / "config.yaml", "w"))
         with open(run_dir / "config.yaml", "r") as f_yaml, open(run_dir / "config.json", "w") as f_json:
             yaml_cfg = yaml.safe_load(f_yaml)
             json.dump(yaml_cfg, f_json, indent=2)
 
-    # Load VLA checkpoint (if resuming from training) or Base VLM otherwise (from `cfg.vla.base_vlm` ID or Path)
-    #   =>> Note :: Verifies that all parameters are loaded in FP32 on load!
-    overwatch.info(f"Loading Base VLM `{cfg.vla.base_vlm}` from ID/Path")
-    if cfg.pretrained_checkpoint is not None:
-        # [Validate] Pretrained Checkpoint `step` and `epoch` should match `resume_step` and `resume_epoch`
-        #   =>> Note :: We make developers pass in `resume_*` arguments as an extra sanity check!
-        if cfg.is_resume:
-            assert int(re.search("step-(.+?)-", cfg.pretrained_checkpoint.name).group(1)) == cfg.resume_step
-            assert int(re.search("epoch-(.+?)-", cfg.pretrained_checkpoint.name).group(1)) == cfg.resume_epoch
-
-        vlm = load_vla(cfg.pretrained_checkpoint, hf_token=hf_token, load_for_training=True, cache_dir=cfg.pretrain_vlm)
-
+    # --- HF 토큰/캐시 ---
+    if isinstance(cfg.hf_token, Path):
+        hf_token = cfg.hf_token.read_text().strip()
     else:
-        vlm = load(cfg.pretrain_vlm, hf_token=hf_token, load_for_training=True, cache_dir=cfg.pretrain_vlm)
+        hf_token = (cfg.hf_token or os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_HUB_TOKEN") or None)
+    os.environ.setdefault("HF_HOME", str(cfg.hf_cache_dir))
+    os.environ.setdefault("TRANSFORMERS_CACHE", str(cfg.hf_cache_dir))
 
-    # [Validate] Model should be in Full Precision!
-    for param in vlm.parameters():
-        assert param.dtype == torch.float32, f"Loaded VLM parameter not in full precision: {param}"
+    # --- 베이스 VLM 로드 (FP32) ---
+    overwatch.info(f"Loading Base VLM `{cfg.pretrain_vlm}`")
+    if cfg.pretrained_checkpoint is not None:
+        raise NotImplementedError("Resume-from-checkpoint with LoRA pretrain is not wired here yet.")
+    vlm = load(cfg.pretrain_vlm, hf_token=hf_token, load_for_training=True, cache_dir=str(cfg.hf_cache_dir))
 
-    # [LoRA] Apply LoRA if enabled
-    lora_config = None
+    if cfg.use_flash_attention:
+        # PyTorch 2.x scaled dot-product attention 커널 선택
+        torch.backends.cuda.sdp_kernel(enable_flash=True, enable_mem_efficient=True, enable_math=False)
+
+        # HF Llama 구현이 지원하면 FA2 요청
+        try:
+            vlm.llm_backbone.llm.config.attn_implementation = "flash_attention_2"
+        except Exception:
+            pass  # 설치가 안되어 있으면 SDP만 사용
+
+
+    for p in vlm.parameters():
+        assert p.dtype == torch.float32, "Model must be loaded in FP32 before PEFT."
+
+    # --- LoRA: LLM 서브모듈에만 주입 ---
     if cfg.use_lora:
-        overwatch.info(f"Applying LoRA with rank={cfg.lora_rank}, dropout={cfg.lora_dropout}")
-        
-        # Quantization Config =>> only if LoRA fine-tuning
-        quantization_config = None
-        if cfg.use_quantization:
-            quantization_config = BitsAndBytesConfig(
-                load_in_4bit=True, bnb_4bit_compute_dtype=torch.bfloat16, bnb_4bit_quant_type="nf4"
-            )
-            vlm = prepare_model_for_kbit_training(vlm)
-        
-        # Apply LoRA
-        lora_config = LoraConfig(
+        if cfg.lora_target == "attn":
+            target_modules_llm = ["q_proj", "k_proj", "v_proj", "o_proj"]
+        elif cfg.lora_target == "attn_mlp":
+            target_modules_llm = ["q_proj", "k_proj", "v_proj", "o_proj",
+                                  "gate_proj", "up_proj", "down_proj"]
+        else:
+            raise ValueError(f"Unsupported lora_target={cfg.lora_target}. Use 'attn' or 'attn_mlp'.")
+
+        lcfg_llm = LoraConfig(
             r=cfg.lora_rank,
             lora_alpha=min(cfg.lora_rank, 16),
             lora_dropout=cfg.lora_dropout,
-            target_modules="all-linear",
-            init_lora_weights="gaussian",
+            target_modules=target_modules_llm,
+            task_type=TaskType.CAUSAL_LM,
+            bias="none",
         )
-        vlm = get_peft_model(vlm, lora_config)
-        vlm.print_trainable_parameters()
+        base_llm = vlm.llm_backbone.llm
+        peft_llm = get_peft_model(base_llm, lcfg_llm)
+        vlm.llm_backbone.llm = peft_llm
+        if overwatch.is_rank_zero():
+            vlm.llm_backbone.llm.print_trainable_parameters()
 
-    # Determine training "stage" based on frozen vs unfrozen parameters --> supports different fine-tuning schemes!
-    if not cfg.vla.freeze_vision_backbone and not cfg.vla.freeze_llm_backbone:
-        stage = "vla-full-train"  # Full fine-tuning
-    elif cfg.vla.freeze_vision_backbone and not cfg.vla.freeze_llm_backbone:
-        stage = "vla-train"  # Frozen vision encoder
-    elif not cfg.vla.freeze_vision_backbone and cfg.vla.freeze_llm_backbone:
-        assert cfg.vla.unfreeze_last_llm_layer, "You should unfreeze at least the last layer of your LLM!"
-        stage = "vla-sandwich-train"  # Fine-tuning vision encoder, projector, and LLM last layer
-    elif cfg.vla.freeze_vision_backbone and cfg.vla.freeze_llm_backbone:
-        assert cfg.vla.unfreeze_last_llm_layer, "Need to unfreeze at least last LLM layer to train!"
-        stage = "vla-last-layer-train"  # Fine-tuning LLM last layer only
-    else:
-        raise ValueError(
-            "Weight freezing configuration not supported. VLA config has the following parameters: "
-            f"freeze_vision_backbone: {cfg.vla.freeze_vision_backbone}"
-            f"freeze_llm_backbone: {cfg.vla.freeze_llm_backbone}"
-            f"unfreeze_last_llm_layer: {cfg.vla.unfreeze_last_llm_layer}"
-        )
-
-    # [Explicit] Call to `freeze_backbones` here for clarity =>> will log exactly what is/is not frozen
-    overwatch.info(f"Invoking `VLM.freeze_backbones()` for `{vla_id}` => Stage: `{stage}`")
+    # --- 동결 정책: projector+LLM 학습, vision freeze ---
+    stage = "vla-train"  # projector + LLM train, vision freeze
     vlm.freeze_backbones(stage)
 
-    # Print number of total/trainable model parameters
-    num_params = sum(p.numel() for p in vlm.parameters())
-    num_trainable_params = sum(p.numel() for p in vlm.parameters() if p.requires_grad)
-    overwatch.info(
-        f"# Parameters (in millions): {num_params / 10**6:.3f} Total, {num_trainable_params / 10**6:.3f} Trainable"
-    )
-    
+    # --- LAM 로드 ---
     from latent_action_model.genie.modules.lam import ControllableDINOLatentActionModel
-
-    latent_action_model = ControllableDINOLatentActionModel(
+    lam = ControllableDINOLatentActionModel(
         in_dim=3,
         model_dim=cfg.lam_model_dim,
         latent_dim=cfg.lam_latent_dim,
@@ -334,68 +216,66 @@ def train(cfg: TrainConfig) -> None:
         enc_blocks=cfg.lam_enc_blocks,
         dec_blocks=cfg.lam_dec_blocks,
         num_heads=cfg.lam_num_heads,
-        dropout=0.,
+        dropout=0.0,
     )
-
-    lam_ckpt = torch.load(cfg.lam_path)['state_dict']
-    new_ckpt = {}
-    for key in lam_ckpt.keys():
-        new_ckpt[key.replace("lam.", "")] = lam_ckpt[key]
-
-    latent_action_model.load_state_dict(new_ckpt, strict=True)
-    latent_action_model = latent_action_model.to(device_id).eval()
-
-    # Get VLA Dataset & Collator for LIBERO
-    overwatch.info(f"Creating VLA LIBERO Dataset with Mixture `{cfg.dataset_name}`")
+    lam_ckpt = torch.load(cfg.lam_path, map_location="cpu")["state_dict"]
+    lam.load_state_dict({k.replace("lam.", ""): v for k, v in lam_ckpt.items()}, strict=True)
+    lam = lam.to(device_id).eval()
     
-    # Create LIBERO-specific batch transform
-    batch_transform = RLDSBatchTransformLIBERO_withHis(
-        latent_action_model,
+    # LAM을 half precision으로 변환하여 메모리 사용량 감소
+    lam = lam.half()
+
+    # --- Dataset/Transform (LIBERO latent action) ---
+    batch_tf = RLDSBatchTransformLIBERO_withHis(
+        lam,
         vlm.llm_backbone.get_tokenizer(),
         image_transform=vlm.vision_backbone.get_image_transform(),
         image_transform_lam=transforms.ToTensor(),
         prompt_builder_fn=PurePromptBuilder if "v01" not in str(cfg.pretrain_vlm) else VicunaV15ChatPromptBuilder,
-        window_size=cfg.window_size
+        window_size=cfg.window_size,
     )
-    
-    # Create LIBERO dataset
     vla_dataset = RLDSDataset(
         cfg.data_root_dir,
         cfg.dataset_name,
-        batch_transform,
+        batch_tf,
         resize_resolution=vlm.vision_backbone.default_image_resolution[1:],
         shuffle_buffer_size=cfg.shuffle_buffer_size,
         image_aug=cfg.image_aug,
-        window_size=cfg.window_size + 1,        # for constructing history latent actions
-        training_phase='pre-training',
+        window_size=cfg.window_size + 1,   # (히스토리 포함)
+        training_phase="post-training",    # chunk_act_obs_libero 사용을 위해 변경
     )
-    
-    # Create LIBERO-specific collator
-    collator = PaddedCollatorForActionPrediction_LIBERO(
-        vlm.llm_backbone.get_tokenizer().model_max_length, 
-        vlm.llm_backbone.get_tokenizer().pad_token_id, 
-        padding_side="right"
-    )
-    
-    # Add special tokens for latent actions
-    special_tokens_dict = {'additional_special_tokens': [f'<ACT_{i}>' for i in range(cfg.codebook_size)]}
-    num_added_toks = vlm.llm_backbone.get_tokenizer().add_special_tokens(special_tokens_dict)
 
-    # Save dataset statistics for de-normalization at inference time
+    # --- 액션 토큰 추가 & 임베딩 리사이즈 ---
+    action_tokenizer = _build_action_tokenizer_and_resize(vlm, cfg.codebook_size)
+    # if cfg.clamp_seq_len is not None:
+    #     tok = vlm.llm_backbone.get_tokenizer()
+    #     try:
+    #         tok.model_max_length = min(getattr(tok, "model_max_length", cfg.clamp_seq_len), cfg.clamp_seq_len)
+    #     except Exception:
+    #         pass
+
+    # --- collator ---
+    collator = PaddedCollatorForActionPrediction_LIBERO(
+        vlm.llm_backbone.get_tokenizer().model_max_length,
+        vlm.llm_backbone.get_tokenizer().pad_token_id,
+        padding_side="right",
+    )
+
+    # --- 통계 저장 ---
     if overwatch.is_rank_zero():
         save_dataset_statistics(vla_dataset.dataset_statistics, run_dir)
 
-    # Create Train Strategy
-    overwatch.info(f"Initializing Train Strategy `{cfg.train_strategy}`")
+    # --- 트레인 전략 구성 & 셋업 ---
     train_strategy = get_train_strategy(
         train_strategy=cfg.train_strategy,
         vlm=vlm,
         device_id=device_id,
         stage=stage,
         epochs=cfg.epochs,
-        max_steps=cfg.max_steps,
+        max_steps=cfg.max_steps,  # None일 수 있음 → 아래에서 보정
         global_batch_size=cfg.global_batch_size,
         per_device_batch_size=cfg.per_device_batch_size,
+        gradient_accumulation_steps=cfg.gradient_accumulation_steps,  # gradient accumulation 추가
         learning_rate=cfg.learning_rate,
         weight_decay=cfg.weight_decay,
         max_grad_norm=cfg.max_grad_norm,
@@ -408,8 +288,20 @@ def train(cfg: TrainConfig) -> None:
     )
     train_strategy.run_setup(run_dir=run_dir, n_train_examples=len(vla_dataset))
 
-    # Create Metrics =>> Handles on the fly tracking, logging to specified trackers (e.g., JSONL, Weights & Biases)
-    overwatch.info(f"Creating Metrics with Active Trackers => `{cfg.trackers}`")
+    # === IterableDataset 안전: tqdm가 len(dataloader)에 의존하지 않도록 self.max_steps를 명시 ===
+    # Strategy가 계산한 값 있으면 사용, 없으면 추정/기본값
+    effective_max_steps = getattr(train_strategy, "max_steps", None)
+    if effective_max_steps is None:
+        try:
+            n = len(vla_dataset)
+            steps_per_epoch = max(n // cfg.global_batch_size, 1)
+            effective_max_steps = steps_per_epoch * max(cfg.epochs, 1)
+        except TypeError:
+            # IterableDataset 길이 모르면 대략치
+            effective_max_steps = 100000
+    train_strategy.max_steps = int(effective_max_steps)
+
+    # --- 메트릭 로거 ---
     metrics = VLAMetrics(
         cfg.trackers,
         cfg.run_id,
@@ -421,30 +313,19 @@ def train(cfg: TrainConfig) -> None:
         resume_epoch=cfg.resume_epoch,
     )
 
-    # Run VLA Training
-    overwatch.info("Starting VLA Latent Action Training Loop")
-    
-    # Custom training loop with LoRA checkpoint saving support
-    if cfg.use_lora:
-        _run_lora_training_loop(
-            train_strategy, vla_dataset, collator, vlm.llm_backbone.get_tokenizer(), metrics, 
-            cfg.save_interval, vlm, lora_config, adapter_dir, run_dir
-        )
-    else:
-        train_strategy.run_latent_action_training(
-            vla_dataset,
-            collator,
-            vlm.llm_backbone.get_tokenizer(),
-            metrics,
-            save_interval=cfg.save_interval,
-        )
+    # --- 학습 시작: Strategy 표준 루프 사용 / LoRA 어댑터만 저장 ---
+    overwatch.info("[*] Starting VLA LoRA Latent Action Pre-Training Loop")
+    train_strategy.run_latent_action_training(
+        vla_dataset=vla_dataset,
+        collator=collator,
+        action_tokenizer=action_tokenizer,
+        metrics=metrics,
+        save_interval=cfg.save_interval,
+        save_full_model=False,  # ← trainable-only 저장 (LoRA 어댑터)
+    )
 
-    # Finalize
-    overwatch.info("Done with Training =>> Finalizing Metrics")
+    overwatch.info("Finalize Metrics")
     metrics.finalize()
-
-    # And... we're done!
-    overwatch.info("... and that's all, folks!")
     dist.barrier()
     dist.destroy_process_group()
 

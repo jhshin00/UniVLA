@@ -99,7 +99,7 @@ class Exp_DinoSigLIP_224px_LIBERO(Exp_SigLIP_224px_Bridge):
     data_mix: str = "libero_combined"
     shuffle_buffer_size: int = 16_000   
 
-    expected_world_size: int = 1
+    expected_world_size: int = 4
     global_batch_size: int = 32
     per_device_batch_size: int = 32
 
