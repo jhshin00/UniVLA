@@ -75,18 +75,22 @@ class TrainConfig:
     lora_dropout: float = 0.0
     # (양자화는 prismatic.load 경로와 충돌 가능성 → 비활성 권장)
 
+    # === Vision LoRA ===
+    lora_vision: bool = True                                    # Vision backbone에도 LoRA 적용
+    lora_vision_target: str = "attn_mlp"                           # Vision LoRA 대상: "attn" 또는 "attn_mlp"
+
     # === LIBERO dataloader ===
     window_size: int = 12  # 8 -> 6으로 더 줄여서 메모리 사용량 감소
     shuffle_buffer_size: int = 16000  # 8000 -> 4000으로 더 줄여서 메모리 사용량 감소
     
     # === 메모리 최적화 ===
-    gradient_accumulation_steps: int = 4  # gradient accumulation을 더 늘려서 effective batch size 유지
+    gradient_accumulation_steps: int = 1  # gradient accumulation을 더 늘려서 effective batch size 유지
     max_memory_usage: float = 0.8  # GPU 메모리 사용량 제한 (80%)
 
     # === 로깅 ===
     trackers: Tuple[str, ...] = ("jsonl", "wandb")
     wandb_project: str = "univla-lora-libero"
-    wandb_entity: str = "jhshin406"
+    wandb_entity: str = "jlee24"
 
     use_flash_attention: bool = True
     lora_target: str = "attn"  # "attn_mlp" -> "attn"으로 변경하여 메모리 사용량 감소
@@ -117,11 +121,31 @@ def _build_action_tokenizer_and_resize(vlm, codebook_size: int) -> ActionTokeniz
     return ActionTokenizer(tok)
 
 
+def _log_gpu_memory_usage(stage: str) -> None:
+    """GPU 메모리 사용량 로깅"""
+    if torch.cuda.is_available():
+        allocated = torch.cuda.memory_allocated() / 1024**3  # GB
+        cached = torch.cuda.memory_reserved() / 1024**3     # GB
+        overwatch.info(f"[{stage}] GPU Memory - Allocated: {allocated:.2f}GB, Cached: {cached:.2f}GB")
+
+
+# def _optimize_memory_usage() -> None:
+#     """메모리 사용량 최적화"""
+#     if torch.cuda.is_available():
+#         torch.cuda.empty_cache()
+#         # PyTorch 메모리 할당 전략 최적화
+#         torch.cuda.memory._set_allocator_settings("max_split_size_mb=512")
+
+
 @draccus.wrap()
 def train(cfg: TrainConfig) -> None:
     overwatch.info("OpenVLA LoRA Pre-Training on LIBERO :: Warmup")
     torch.cuda.set_device(device_id := overwatch.local_rank())
     torch.cuda.empty_cache()
+
+    # 초기 메모리 상태 확인
+    # _optimize_memory_usage()
+    _log_gpu_memory_usage("Initial")
 
     # --- Run ID 구성 ---
     vla_id = cfg.vla.vla_id
@@ -134,6 +158,8 @@ def train(cfg: TrainConfig) -> None:
         run_id += "--image_aug"
     if cfg.use_lora:
         run_id += f"+lora-r{cfg.lora_rank}+dropout-{cfg.lora_dropout}"
+        if cfg.lora_vision:
+            run_id += f"+vlora-{cfg.lora_vision_target}"
     run_id += f"-LIBERO-Latent-Action-Pretraining-ws-{cfg.window_size}"
     cfg.run_id = run_id
 
@@ -163,6 +189,8 @@ def train(cfg: TrainConfig) -> None:
         raise NotImplementedError("Resume-from-checkpoint with LoRA pretrain is not wired here yet.")
     vlm = load(cfg.pretrain_vlm, hf_token=hf_token, load_for_training=True, cache_dir=str(cfg.hf_cache_dir))
 
+    _log_gpu_memory_usage("After VLM Loading")
+
     if cfg.use_flash_attention:
         # PyTorch 2.x scaled dot-product attention 커널 선택
         torch.backends.cuda.sdp_kernel(enable_flash=True, enable_mem_efficient=True, enable_math=False)
@@ -177,7 +205,7 @@ def train(cfg: TrainConfig) -> None:
     for p in vlm.parameters():
         assert p.dtype == torch.float32, "Model must be loaded in FP32 before PEFT."
 
-    # --- LoRA: LLM 서브모듈에만 주입 ---
+    # --- LoRA: LLM 서브모듈에 주입 ---
     if cfg.use_lora:
         if cfg.lora_target == "attn":
             target_modules_llm = ["q_proj", "k_proj", "v_proj", "o_proj"]
@@ -201,9 +229,86 @@ def train(cfg: TrainConfig) -> None:
         if overwatch.is_rank_zero():
             vlm.llm_backbone.llm.print_trainable_parameters()
 
-    # --- 동결 정책: projector+LLM 학습, vision freeze ---
-    stage = "vla-train"  # projector + LLM train, vision freeze
-    vlm.freeze_backbones(stage)
+    # --- Vision LoRA: Vision backbone에 LoRA 적용 ---
+    if cfg.use_lora and cfg.lora_vision:
+        overwatch.info(f"Applying Vision LoRA with target={cfg.lora_vision_target}")
+
+        # Vision ViT target modules 설정
+        if cfg.lora_vision_target == "attn":
+            target_modules_vision = ["qkv", "proj"]  # ViT attention layers
+        elif cfg.lora_vision_target == "attn_mlp":
+            target_modules_vision = ["qkv", "proj", "fc1", "fc2"]  # ViT attention + MLP
+        else:
+            raise ValueError(f"Unsupported lora_vision_target={cfg.lora_vision_target}. Use 'attn' or 'attn_mlp'.")
+
+        vision_lora_config = LoraConfig(
+            r=cfg.lora_rank,
+            lora_alpha=min(cfg.lora_rank, 16),
+            lora_dropout=cfg.lora_dropout,
+            target_modules=target_modules_vision,
+            task_type=TaskType.FEATURE_EXTRACTION,
+            bias="none",
+        )
+
+        # DinoSigLIP의 경우 두 featurizer에 모두 적용
+        if hasattr(vlm.vision_backbone, 'dino_featurizer') and hasattr(vlm.vision_backbone, 'siglip_featurizer'):
+            overwatch.info("Applying LoRA to DINOv2 featurizer")
+            vlm.vision_backbone.dino_featurizer = get_peft_model(
+                vlm.vision_backbone.dino_featurizer, vision_lora_config
+            )
+            overwatch.info("Applying LoRA to SigLIP featurizer")
+            vlm.vision_backbone.siglip_featurizer = get_peft_model(
+                vlm.vision_backbone.siglip_featurizer, vision_lora_config
+            )
+            if overwatch.is_rank_zero():
+                overwatch.info("=== DINOv2 LoRA Parameters ===")
+                vlm.vision_backbone.dino_featurizer.print_trainable_parameters()
+                overwatch.info("=== SigLIP LoRA Parameters ===")
+                vlm.vision_backbone.siglip_featurizer.print_trainable_parameters()
+
+        # 단일 featurizer를 가진 다른 vision backbone의 경우
+        elif hasattr(vlm.vision_backbone, 'featurizer'):
+            overwatch.info("Applying LoRA to single vision featurizer")
+            vlm.vision_backbone.featurizer = get_peft_model(
+                vlm.vision_backbone.featurizer, vision_lora_config
+            )
+            if overwatch.is_rank_zero():
+                vlm.vision_backbone.featurizer.print_trainable_parameters()
+
+        else:
+            overwatch.warning("Could not find suitable vision featurizer for LoRA application")
+
+        _log_gpu_memory_usage("After Vision LoRA")
+
+    # --- 동결 정책: Vision LoRA를 고려한 커스텀 freezing ---
+    if cfg.use_lora and cfg.lora_vision:
+        # Vision LoRA 적용 시: Vision backbone의 base parameters는 freeze, LoRA adapters만 학습
+        stage = "vla-lora-train"  # 커스텀 stage
+
+        # 커스텀 freezing: Vision backbone base parameters freeze, LoRA adapters는 trainable 유지
+        overwatch.info("Applying custom freezing strategy for Vision+LLM LoRA training")
+
+        # Vision backbone: base parameters만 freeze (LoRA adapters는 자동으로 trainable)
+        for name, param in vlm.vision_backbone.named_parameters():
+            if 'lora_' not in name:  # LoRA 파라미터가 아닌 base parameters만 freeze
+                param.requires_grad_(False)
+
+        # LLM backbone: 이미 PEFT 적용되어 있으므로 base parameters는 자동으로 frozen
+        # Projector: 항상 trainable 유지
+        vlm.projector.requires_grad_(True)
+
+        # 훈련 가능한 파라미터 출력
+        if overwatch.is_rank_zero():
+            total_params = sum(p.numel() for p in vlm.parameters())
+            trainable_params = sum(p.numel() for p in vlm.parameters() if p.requires_grad)
+            overwatch.info(f"Total Parameters: {total_params:,}")
+            overwatch.info(f"Trainable Parameters: {trainable_params:,} ({100*trainable_params/total_params:.2f}%)")
+    else:
+        # 기존 동결 정책: projector+LLM 학습, vision freeze
+        stage = "vla-train"  # projector + LLM train, vision freeze
+        vlm.freeze_backbones(stage)
+
+    _log_gpu_memory_usage("After Freezing")
 
     # --- LAM 로드 ---
     from latent_action_model.genie.modules.lam import ControllableDINOLatentActionModel
@@ -221,9 +326,8 @@ def train(cfg: TrainConfig) -> None:
     lam_ckpt = torch.load(cfg.lam_path, map_location="cpu")["state_dict"]
     lam.load_state_dict({k.replace("lam.", ""): v for k, v in lam_ckpt.items()}, strict=True)
     lam = lam.to(device_id).eval()
-    
-    # LAM을 half precision으로 변환하여 메모리 사용량 감소
-    lam = lam.half()
+
+    _log_gpu_memory_usage("After LAM Loading")
 
     # --- Dataset/Transform (LIBERO latent action) ---
     batch_tf = RLDSBatchTransformLIBERO_withHis(
@@ -275,7 +379,6 @@ def train(cfg: TrainConfig) -> None:
         max_steps=cfg.max_steps,  # None일 수 있음 → 아래에서 보정
         global_batch_size=cfg.global_batch_size,
         per_device_batch_size=cfg.per_device_batch_size,
-        gradient_accumulation_steps=cfg.gradient_accumulation_steps,  # gradient accumulation 추가
         learning_rate=cfg.learning_rate,
         weight_decay=cfg.weight_decay,
         max_grad_norm=cfg.max_grad_norm,

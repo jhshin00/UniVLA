@@ -159,3 +159,5 @@ dmypy.json
 # Caches and Datasets
 cache/
 data/
+
+ssd2/
