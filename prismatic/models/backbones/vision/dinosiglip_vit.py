@@ -134,14 +134,32 @@ class DinoSigLIPViTBackbone(VisionBackbone):
             raise ValueError(f"Image Resize Strategy `{self.image_resize_strategy}` is not supported!")
 
     def get_fsdp_wrapping_policy(self) -> Callable:
-        """Return a simple FSDP policy that wraps each ViT block and then both of the _entire_ featurizers."""
-        vit_wrap_policy = partial(_module_wrap_policy, module_classes={VisionTransformer})
-        transformer_block_policy = partial(transformer_auto_wrap_policy, transformer_layer_cls={Block})
-        return partial(_or_policy, policies=[vit_wrap_policy, transformer_block_policy])
+        """Return a simple FSDP policy that wraps each ViT block but excludes patch_embed Conv2D modules."""
+        import torch.nn as nn
+        from timm.layers.patch_embed import PatchEmbed
+
+        # Conv2D와 PatchEmbed 모듈을 FSDP에서 명시적으로 제외
+        def safe_vision_wrap_policy(module, recurse, nonwrapped_numel):
+            # Conv2D 모듈은 절대 wrap하지 않음
+            if isinstance(module, nn.Conv2d):
+                print(f"🔧 DEBUG: Excluding Conv2d from FSDP: {type(module)}")
+                return False
+
+            # PatchEmbed 모듈도 wrap하지 않음
+            if isinstance(module, PatchEmbed):
+                print(f"🔧 DEBUG: Excluding PatchEmbed from FSDP: {type(module)}")
+                return False
+
+            # Block 모듈만 wrap
+            if isinstance(module, Block):
+                return True
+
+            return False
+
+        return safe_vision_wrap_policy
 
     def forward(self, pixel_values: Dict[str, torch.Tensor]) -> torch.Tensor:
         """Runs the transformed image/pixel tensors through each vision backbone, returning concatenated patches."""
-        # print(pixel_values.shape)
         if isinstance(pixel_values, dict):
             dino_patches = self.dino_featurizer(pixel_values["dino"])
             siglip_patches = self.siglip_featurizer(pixel_values["siglip"])

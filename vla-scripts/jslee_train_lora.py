@@ -233,30 +233,18 @@ def train(cfg: TrainConfig) -> None:
     if cfg.use_lora and cfg.lora_vision:
         overwatch.info(f"Applying Vision LoRA with target={cfg.lora_vision_target}")
 
-        # Vision ViT target modules 설정
-        # TODO jslee mod !! delete "proj"
+        # Vision ViT target modules 설정 - 패턴 매칭으로 단순화
         if cfg.lora_vision_target == "attn":
-            # 더 구체적으로 지정하여 patch_embed.proj(Conv2D) 완전히 제외
-            target_modules_vision = []
-            # 모든 transformer block의 attention layer 수동 지정
-            for i in range(24):  # DINOv2: 24 blocks, SigLIP: 27 blocks이지만 24까지는 공통
-                target_modules_vision.extend([
-                    f"blocks.{i}.attn.qkv",
-                    f"blocks.{i}.attn.proj"
-                ])
-            overwatch.info(f"Vision LoRA target modules: {len(target_modules_vision)} modules (blocks 0-23)")
+            target_modules_vision = ["blocks.*.attn.qkv", "blocks.*.attn.proj"]
         elif cfg.lora_vision_target == "attn_mlp":
-            target_modules_vision = []
-            for i in range(24):
-                target_modules_vision.extend([
-                    f"blocks.{i}.attn.qkv",
-                    f"blocks.{i}.attn.proj",
-                    f"blocks.{i}.mlp.fc1",
-                    f"blocks.{i}.mlp.fc2"
-                ])
-            overwatch.info(f"Vision LoRA target modules: {len(target_modules_vision)} modules (blocks 0-23)")
+            target_modules_vision = [
+                "blocks.*.attn.qkv", "blocks.*.attn.proj",
+                "blocks.*.mlp.fc1", "blocks.*.mlp.fc2"
+            ]
         else:
             raise ValueError(f"Unsupported lora_vision_target={cfg.lora_vision_target}. Use 'attn' or 'attn_mlp'.")
+
+        overwatch.info(f"Vision LoRA target modules: {target_modules_vision}")
 
         vision_lora_config = LoraConfig(
             r=cfg.lora_rank,
@@ -457,11 +445,11 @@ def train(cfg: TrainConfig) -> None:
 
     # --- Dataset/Transform (LIBERO latent action) ---
     batch_tf = RLDSBatchTransformLIBERO_withHis(
-        lam,
-        vlm.llm_backbone.get_tokenizer(),
-        image_transform=vlm.vision_backbone.get_image_transform(),
-        image_transform_lam=transforms.ToTensor(),
-        prompt_builder_fn=PurePromptBuilder if "v01" not in str(cfg.pretrain_vlm) else VicunaV15ChatPromptBuilder,
+        lam, # Latent Action Model
+        vlm.llm_backbone.get_tokenizer(), # LLM tokenizer
+        image_transform=vlm.vision_backbone.get_image_transform(), # Vision transform
+        image_transform_lam=transforms.ToTensor(), # LAM image transform
+        prompt_builder_fn=PurePromptBuilder if "v01" not in str(cfg.pretrain_vlm) else VicunaV15ChatPromptBuilder, # Prompt builder
         window_size=cfg.window_size,
     )
     vla_dataset = RLDSDataset(
