@@ -564,6 +564,15 @@ class LAPA(nn.Module):
         recon_loss = F.mse_loss(video, recon_video)
         
         return recon_loss, num_unique_codes
+    
+    def vq_encode(self, videos: Tensor) -> Dict:
+        batch = {"videos": videos}
+        
+        indices = self.forward(batch, return_only_codebook_ids=True)
+        
+        return {
+            "indices": indices,
+        }
         
         
         

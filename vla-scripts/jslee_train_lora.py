@@ -233,18 +233,99 @@ def train(cfg: TrainConfig) -> None:
     if cfg.use_lora and cfg.lora_vision:
         overwatch.info(f"Applying Vision LoRA with target={cfg.lora_vision_target}")
 
-        # Vision ViT target modules 설정 - 패턴 매칭으로 단순화
+        # 🔍 DEBUG: 실제 모듈 구조 확인
+        if overwatch.is_rank_zero():
+            print("\n🔧 DEBUG: Inspecting DinoSigLIP module structure...")
+
+            # DINOv2 featurizer 구조 확인
+            print("\n📋 DINOv2 featurizer modules:")
+            dino_attention_modules = []
+            dino_mlp_modules = []
+            for name, module in vlm.vision_backbone.dino_featurizer.named_modules():
+                if 'blocks.' in name and ('attn' in name or 'mlp' in name):
+                    print(f"  {name} -> {type(module)}")
+                    if 'attn' in name and not 'norm' in name:
+                        dino_attention_modules.append(name)
+                    elif 'mlp' in name and not 'norm' in name:
+                        dino_mlp_modules.append(name)
+
+            # SigLIP featurizer 구조 확인
+            print("\n📋 SigLIP featurizer modules:")
+            siglip_attention_modules = []
+            siglip_mlp_modules = []
+            for name, module in vlm.vision_backbone.siglip_featurizer.named_modules():
+                if 'blocks.' in name and ('attn' in name or 'mlp' in name):
+                    print(f"  {name} -> {type(module)}")
+                    if 'attn' in name and not 'norm' in name:
+                        siglip_attention_modules.append(name)
+                    elif 'mlp' in name and not 'norm' in name:
+                        siglip_mlp_modules.append(name)
+
+            print(f"\n📊 Summary:")
+            print(f"  DINOv2 attention modules found: {len(dino_attention_modules)}")
+            print(f"  DINOv2 MLP modules found: {len(dino_mlp_modules)}")
+            print(f"  SigLIP attention modules found: {len(siglip_attention_modules)}")
+            print(f"  SigLIP MLP modules found: {len(siglip_mlp_modules)}")
+
+            # 실제로 발견된 모듈들 샘플 출력
+            if dino_attention_modules:
+                print(f"  DINOv2 attention examples: {dino_attention_modules[:3]}...")
+            if dino_mlp_modules:
+                print(f"  DINOv2 MLP examples: {dino_mlp_modules[:3]}...")
+
+        # 실제 모듈 구조를 기반으로 target modules 동적 생성
+        def _extract_common_attention_mlp_patterns(featurizer, featurizer_name):
+            """실제 featurizer에서 attention/MLP 모듈 패턴 추출"""
+            attention_modules = []
+            mlp_modules = []
+
+            for name, module in featurizer.named_modules():
+                # patch_embed.proj (Conv2D) 제외
+                if 'patch_embed' in name:
+                    continue
+
+                # blocks의 attention과 mlp 모듈만 선택
+                if 'blocks.' in name:
+                    if 'attn' in name and not ('norm' in name or 'drop' in name):
+                        # Linear layer만 선택 (norm, dropout 제외)
+                        if hasattr(module, 'weight') and len(module.weight.shape) == 2:
+                            attention_modules.append(name)
+                    elif 'mlp' in name and not ('norm' in name or 'drop' in name):
+                        # Linear layer만 선택
+                        if hasattr(module, 'weight') and len(module.weight.shape) == 2:
+                            mlp_modules.append(name)
+
+            print(f"  {featurizer_name} extracted - Attn: {len(attention_modules)}, MLP: {len(mlp_modules)}")
+            return attention_modules, mlp_modules
+
+        # 두 featurizer에서 공통 패턴 추출
+        dino_attn, dino_mlp = _extract_common_attention_mlp_patterns(
+            vlm.vision_backbone.dino_featurizer, "DINOv2"
+        )
+        siglip_attn, siglip_mlp = _extract_common_attention_mlp_patterns(
+            vlm.vision_backbone.siglip_featurizer, "SigLIP"
+        )
+
+        # Target modules 결정
         if cfg.lora_vision_target == "attn":
-            target_modules_vision = ["blocks.*.attn.qkv", "blocks.*.attn.proj"]
+            target_modules_vision = list(set(dino_attn + siglip_attn))  # 중복 제거
         elif cfg.lora_vision_target == "attn_mlp":
-            target_modules_vision = [
-                "blocks.*.attn.qkv", "blocks.*.attn.proj",
-                "blocks.*.mlp.fc1", "blocks.*.mlp.fc2"
-            ]
+            target_modules_vision = list(set(dino_attn + dino_mlp + siglip_attn + siglip_mlp))
         else:
             raise ValueError(f"Unsupported lora_vision_target={cfg.lora_vision_target}. Use 'attn' or 'attn_mlp'.")
 
-        overwatch.info(f"Vision LoRA target modules: {target_modules_vision}")
+        overwatch.info(f"Vision LoRA target modules: {len(target_modules_vision)} modules dynamically identified")
+
+        # 샘플 모듈 출력
+        if overwatch.is_rank_zero() and target_modules_vision:
+            print(f"  Target modules sample: {target_modules_vision[:5]}...")
+
+            # Conv2D 모듈이 포함되지 않았는지 재확인
+            conv2d_targets = [name for name in target_modules_vision if 'patch_embed' in name]
+            if conv2d_targets:
+                print(f"  ⚠️  WARNING: Conv2D targets detected: {conv2d_targets}")
+            else:
+                print(f"  ✅ No Conv2D targets found in target list")
 
         vision_lora_config = LoraConfig(
             r=cfg.lora_rank,
@@ -323,55 +404,89 @@ def train(cfg: TrainConfig) -> None:
                 print("DEBUG: Comprehensive LoRA modules check for both featurizers")
                 print("="*80)
 
-                # DINOv2 featurizer 검사
-                print("\n🔍 DINOv2 Featurizer LoRA modules check:")
-                dino_lora_modules = []
-                dino_conv2d_lora_modules = []
-                for name, module in vlm.vision_backbone.dino_featurizer.named_modules():
-                    if hasattr(module, 'lora_A') or 'lora_' in str(type(module)):
-                        dino_lora_modules.append(name)
-                        print(f"  LoRA applied: {name} -> {type(module)}")
-                        if 'patch_embed' in name:
-                            dino_conv2d_lora_modules.append(name)
-                            print(f"  ❌ CRITICAL: DINOv2 Conv2D LoRA detected: {name}")
+                # 강화된 LoRA 적용 검증
+                print("\n🔍 Enhanced LoRA Application Verification:")
 
-                print(f"  DINOv2 Total LoRA modules: {len(dino_lora_modules)}")
-                if dino_conv2d_lora_modules:
-                    print(f"  ❌ PROBLEM: {len(dino_conv2d_lora_modules)} DINOv2 Conv2D LoRA modules found!")
-                else:
-                    print("  ✅ No DINOv2 Conv2D LoRA modules found")
+                def _validate_lora_application(featurizer, featurizer_name, expected_targets):
+                    """LoRA 적용 결과를 예상 target과 비교 검증"""
+                    actual_lora_modules = []
+                    conv2d_lora_modules = []
+                    unexpected_lora_modules = []
 
-                # SigLIP featurizer 검사
-                print("\n🔍 SigLIP Featurizer LoRA modules check:")
-                siglip_lora_modules = []
-                siglip_conv2d_lora_modules = []
-                for name, module in vlm.vision_backbone.siglip_featurizer.named_modules():
-                    if hasattr(module, 'lora_A') or 'lora_' in str(type(module)):
-                        siglip_lora_modules.append(name)
-                        print(f"  LoRA applied: {name} -> {type(module)}")
-                        if 'patch_embed' in name:
-                            siglip_conv2d_lora_modules.append(name)
-                            print(f"  ❌ CRITICAL: SigLIP Conv2D LoRA detected: {name}")
+                    for name, module in featurizer.named_modules():
+                        if hasattr(module, 'lora_A') or 'lora_' in str(type(module)):
+                            actual_lora_modules.append(name)
 
-                print(f"  SigLIP Total LoRA modules: {len(siglip_lora_modules)}")
-                if siglip_conv2d_lora_modules:
-                    print(f"  ❌ PROBLEM: {len(siglip_conv2d_lora_modules)} SigLIP Conv2D LoRA modules found!")
-                else:
-                    print("  ✅ No SigLIP Conv2D LoRA modules found")
+                            # Conv2D 검사
+                            if 'patch_embed' in name:
+                                conv2d_lora_modules.append(name)
+                                print(f"  ❌ CRITICAL: {featurizer_name} Conv2D LoRA: {name}")
 
-                # 전체 결과 요약
-                total_conv2d_issues = len(dino_conv2d_lora_modules) + len(siglip_conv2d_lora_modules)
-                print(f"\n📊 Summary:")
-                print(f"  Total LoRA modules: DINOv2={len(dino_lora_modules)}, SigLIP={len(siglip_lora_modules)}")
-                print(f"  Conv2D LoRA issues: DINOv2={len(dino_conv2d_lora_modules)}, SigLIP={len(siglip_conv2d_lora_modules)}")
+                            # 예상 target에 없는 모듈 검사
+                            if name not in expected_targets:
+                                unexpected_lora_modules.append(name)
+                                print(f"  ⚠️  Unexpected {featurizer_name} LoRA: {name}")
+                            else:
+                                print(f"  ✅ Expected {featurizer_name} LoRA: {name}")
 
+                    # 누락된 target 검사
+                    featurizer_modules = [n for n, _ in featurizer.named_modules()]
+                    missing_targets = [target for target in expected_targets
+                                     if target in featurizer_modules
+                                     and target not in actual_lora_modules]
+
+                    if missing_targets:
+                        print(f"  ⚠️  {featurizer_name} Missing LoRA targets: {missing_targets[:3]}...")
+
+                    return {
+                        'applied': len(actual_lora_modules),
+                        'conv2d_issues': len(conv2d_lora_modules),
+                        'unexpected': len(unexpected_lora_modules),
+                        'missing': len(missing_targets),
+                        'conv2d_modules': conv2d_lora_modules
+                    }
+
+                # DINOv2와 SigLIP에서 예상되는 target modules 분리
+                # PEFT wrapper는 모듈 이름에 "base_model.model." 접두사를 추가함
+                all_dino_modules = [n for n, _ in vlm.vision_backbone.dino_featurizer.named_modules()]
+                all_siglip_modules = [n for n, _ in vlm.vision_backbone.siglip_featurizer.named_modules()]
+
+                # PEFT 접두사를 고려하여 예상 target 생성
+                dino_expected = [f"base_model.model.{t}" for t in target_modules_vision if t in all_dino_modules]
+                siglip_expected = [f"base_model.model.{t}" for t in target_modules_vision if t in all_siglip_modules]
+
+                print(f"  Expected DINOv2 targets: {len(dino_expected)}")
+                print(f"  Expected SigLIP targets: {len(siglip_expected)}")
+
+                # 검증 실행
+                dino_validation = _validate_lora_application(
+                    vlm.vision_backbone.dino_featurizer, "DINOv2", dino_expected
+                )
+                siglip_validation = _validate_lora_application(
+                    vlm.vision_backbone.siglip_featurizer, "SigLIP", siglip_expected
+                )
+
+                # 종합 결과
+                total_conv2d_issues = dino_validation['conv2d_issues'] + siglip_validation['conv2d_issues']
+                total_unexpected = dino_validation['unexpected'] + siglip_validation['unexpected']
+
+                print(f"\n📊 Enhanced Validation Summary:")
+                print(f"  DINOv2: {dino_validation['applied']} LoRA modules applied")
+                print(f"  SigLIP: {siglip_validation['applied']} LoRA modules applied")
+                print(f"  Conv2D issues: {total_conv2d_issues}")
+                print(f"  Unexpected applications: {total_unexpected}")
+                print(f"  Missing targets: {dino_validation['missing'] + siglip_validation['missing']}")
+
+                # 치명적 오류 검사
                 if total_conv2d_issues > 0:
-                    print(f"❌ FATAL: {total_conv2d_issues} Conv2D LoRA modules found across featurizers!")
-                    print("This will cause the 'weight should have at least three dimensions' error!")
+                    print(f"❌ FATAL: {total_conv2d_issues} Conv2D LoRA modules found!")
+                    all_conv2d = dino_validation['conv2d_modules'] + siglip_validation['conv2d_modules']
+                    print(f"   Conv2D modules: {all_conv2d}")
+                    print("This will cause tensor dimension errors during training!")
                     import sys
-                    sys.exit(1)  # 오류 방지를 위해 일단 중단
+                    sys.exit(1)
                 else:
-                    print("✅ All clear: No Conv2D LoRA modules found in either featurizer")
+                    print("✅ Validation passed: No Conv2D LoRA applications detected")
                 print("="*80)
 
             if overwatch.is_rank_zero():
