@@ -161,3 +161,5 @@ cache/
 data/
 
 ssd2/
+
+prism-dinosiglip-224px+mx-libero+n0+b16+x42--image_aug+lora-r32+dropout-0.0+vlora-attn_mlp-LIBERO-Latent-Action-Pretraining-ws-16/
