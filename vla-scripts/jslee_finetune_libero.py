@@ -215,8 +215,62 @@ def finetune(cfg: FinetuneConfig) -> None:
     ).to(device_id)
 
     print("Loading pre-trained LoRA adapters...")
-    # Load Pre-trained LoRA Model (includes both LLM and Vision LoRA if present)
-    vla = PeftModel.from_pretrained(base_vla, cfg.lora_pretrained_path)
+
+    # Check if using new PEFT format (with separate LLM and Vision LoRA)
+    lora_path = Path(cfg.lora_pretrained_path)
+    llm_lora_path = lora_path / "llm_lora"
+    vision_lora_path = lora_path / "vision_lora"
+    projector_path = lora_path / "projector.pt"
+
+    if llm_lora_path.exists():
+        print(f"  Detected new PEFT format at {cfg.lora_pretrained_path}")
+
+        # Load LLM LoRA adapters
+        print(f"  Loading LLM LoRA from {llm_lora_path}...")
+        from peft import PeftModel
+        base_vla.language_model = PeftModel.from_pretrained(base_vla.language_model, str(llm_lora_path))
+        print("  ✅ LLM LoRA loaded")
+
+        # Load Vision LoRA adapters if present
+        if cfg.lora_vision and vision_lora_path.exists():
+            print(f"  Loading Vision LoRA from {vision_lora_path}...")
+
+            # Check for dual featurizers (DinoSigLIP) or single featurizer
+            dino_lora_path = vision_lora_path / "dino"
+            siglip_lora_path = vision_lora_path / "siglip"
+
+            if dino_lora_path.exists() and siglip_lora_path.exists():
+                print("    Loading DINOv2 LoRA...")
+                base_vla.vision_backbone.dino_featurizer = PeftModel.from_pretrained(
+                    base_vla.vision_backbone.dino_featurizer, str(dino_lora_path)
+                )
+                print("    ✅ DINOv2 LoRA loaded")
+
+                print("    Loading SigLIP LoRA...")
+                base_vla.vision_backbone.siglip_featurizer = PeftModel.from_pretrained(
+                    base_vla.vision_backbone.siglip_featurizer, str(siglip_lora_path)
+                )
+                print("    ✅ SigLIP LoRA loaded")
+            elif vision_lora_path.exists():
+                print("    Loading single featurizer LoRA...")
+                base_vla.vision_backbone.featurizer = PeftModel.from_pretrained(
+                    base_vla.vision_backbone.featurizer, str(vision_lora_path)
+                )
+                print("    ✅ Vision LoRA loaded")
+
+        # Load projector weights
+        if projector_path.exists():
+            print(f"  Loading projector from {projector_path}...")
+            base_vla.projector.load_state_dict(torch.load(projector_path, map_location=device_id))
+            print("  ✅ Projector loaded")
+
+        vla = base_vla
+    else:
+        # Legacy format: single PEFT adapter (LLM only)
+        print(f"  Detected legacy PEFT format at {cfg.lora_pretrained_path}")
+        print(f"  Loading LLM LoRA adapters...")
+        vla = PeftModel.from_pretrained(base_vla, cfg.lora_pretrained_path)
+        print("  ⚠️  Note: Vision LoRA not loaded (legacy format)")
 
     # Verify Vision LoRA loading
     if cfg.lora_vision and distributed_state.is_main_process:

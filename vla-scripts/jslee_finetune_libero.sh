@@ -12,8 +12,13 @@ MASTER_ADDR=${MASTER_ADDR:-"127.0.0.1"}
 RANK=${RANK:-0}
 
 # Set paths according to your setup
-VLA_BASE_PATH="/path/to/your/base-vla-model"  # Base VLA model path (without LoRA)
-LORA_PRETRAINED_PATH="/ssd1/UniVLA/vla_log/your-lora-checkpoint"  # LoRA checkpoint from train_lora.py
+# IMPORTANT: You need to export base VLM to HF format first using:
+#   python vla-scripts/export_base_vlm_to_hf.py --model_id prism-dinosiglip-224px+7b --output_dir /ssd1/UniVLA/hf_models/prism-dinosiglip-224px+7b
+# Then convert your .pt checkpoint to PEFT format using:
+#   python vla-scripts/convert_checkpoint_to_peft.py --checkpoint_path <your-checkpoint.pt> --base_model_path <hf-base-model> --output_dir <output-dir>
+
+VLA_BASE_PATH="/ssd1/UniVLA/hf_models/prism-dinosiglip-224px+7b"  # Base VLA model in HF format (export using export_base_vlm_to_hf.py)
+LORA_PRETRAINED_PATH="/ssd1/UniVLA/lora_adapters/step-004000"  # LoRA adapters in PEFT format (convert using convert_checkpoint_to_peft.py)
 LAM_PATH="/ssd1/UniVLA/latent_action_model/logs/task_centric_lam_stage2/epoch=2-step=18000.ckpt"
 DATA_ROOT="/ssd4/libero_raw"
 DATASET_NAME="libero_combined"

@@ -52,6 +52,93 @@ class DDPStrategy(TrainingStrategy):
         torch.save({"model": model_state_dicts, "optimizer": optimizer_state_dict}, checkpoint_path)
         shutil.copy(checkpoint_path, checkpoint_dir / "latest-checkpoint.pt")
 
+        # TODO jslee add
+        # === Additional PEFT Format Save for LoRA Training ===
+        # Check if model has LoRA adapters and save in HuggingFace PEFT format for easy loading
+        self._save_peft_adapters_if_present(run_dir, global_step, epoch, train_loss)
+
+    # TODO jslee add 
+    def _save_peft_adapters_if_present(
+        self,
+        run_dir: Path,
+        global_step: int,
+        epoch: int,
+        train_loss: Optional[float] = None,
+    ) -> None:
+        """Save LoRA adapters in HuggingFace PEFT format if present."""
+        vlm = self.vlm.module  # Unwrap DDP
+
+        # Check if LLM has LoRA adapters (PEFT wrapper)
+        has_llm_lora = hasattr(vlm.llm_backbone.llm, 'peft_config')
+        has_vision_lora = False
+
+        # Check if Vision backbone has LoRA adapters
+        if hasattr(vlm.vision_backbone, 'dino_featurizer'):
+            has_vision_lora = hasattr(vlm.vision_backbone.dino_featurizer, 'peft_config')
+        elif hasattr(vlm.vision_backbone, 'featurizer'):
+            has_vision_lora = hasattr(vlm.vision_backbone.featurizer, 'peft_config')
+
+        if not (has_llm_lora or has_vision_lora):
+            # No LoRA adapters to save
+            return
+
+        # Create PEFT adapter directory
+        if train_loss is None:
+            adapter_dir_name = f"peft-step-{global_step:06d}-epoch-{epoch:02d}-loss=inf"
+        else:
+            adapter_dir_name = f"peft-step-{global_step:06d}-epoch-{epoch:02d}-loss={train_loss:.4f}"
+
+        adapter_dir = run_dir / "checkpoints" / adapter_dir_name
+        adapter_dir.mkdir(parents=True, exist_ok=True)
+
+        overwatch.info(f"Saving PEFT adapters to {adapter_dir}")
+
+        # Save LLM LoRA adapters
+        if has_llm_lora:
+            llm_adapter_dir = adapter_dir / "llm_lora"
+            llm_adapter_dir.mkdir(exist_ok=True)
+            vlm.llm_backbone.llm.save_pretrained(llm_adapter_dir)
+            overwatch.info(f"  ✅ LLM LoRA saved to {llm_adapter_dir}")
+
+        # Save Vision LoRA adapters
+        if has_vision_lora:
+            vision_lora_dir = adapter_dir / "vision_lora"
+            vision_lora_dir.mkdir(exist_ok=True)
+
+            if hasattr(vlm.vision_backbone, 'dino_featurizer') and hasattr(vlm.vision_backbone, 'siglip_featurizer'):
+                # Dual featurizers (DinoSigLIP)
+                dino_dir = vision_lora_dir / "dino"
+                siglip_dir = vision_lora_dir / "siglip"
+                dino_dir.mkdir(exist_ok=True)
+                siglip_dir.mkdir(exist_ok=True)
+
+                if hasattr(vlm.vision_backbone.dino_featurizer, 'peft_config'):
+                    vlm.vision_backbone.dino_featurizer.save_pretrained(dino_dir)
+                    overwatch.info(f"  ✅ DINOv2 LoRA saved to {dino_dir}")
+
+                if hasattr(vlm.vision_backbone.siglip_featurizer, 'peft_config'):
+                    vlm.vision_backbone.siglip_featurizer.save_pretrained(siglip_dir)
+                    overwatch.info(f"  ✅ SigLIP LoRA saved to {siglip_dir}")
+
+            elif hasattr(vlm.vision_backbone, 'featurizer'):
+                # Single featurizer
+                if hasattr(vlm.vision_backbone.featurizer, 'peft_config'):
+                    vlm.vision_backbone.featurizer.save_pretrained(vision_lora_dir)
+                    overwatch.info(f"  ✅ Vision LoRA saved to {vision_lora_dir}")
+
+        # Save projector weights (always trainable in LoRA training)
+        projector_path = adapter_dir / "projector.pt"
+        torch.save(vlm.projector.state_dict(), projector_path)
+        overwatch.info(f"  ✅ Projector saved to {projector_path}")
+
+        # Create symlink to latest PEFT checkpoint
+        latest_link = run_dir / "checkpoints" / "latest-peft"
+        if latest_link.exists():
+            latest_link.unlink()
+        latest_link.symlink_to(adapter_dir_name, target_is_directory=True)
+
+        overwatch.info(f"PEFT adapters saved successfully to {adapter_dir}")
+
     def run_setup(self, run_dir: Path, n_train_examples: int) -> None:
         # Gradient Checkpointing Setup
         if self.enable_gradient_checkpointing:
