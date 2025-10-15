@@ -526,6 +526,11 @@ def train(cfg: TrainConfig) -> None:
         # Projector: 항상 trainable 유지
         vlm.projector.requires_grad_(True)
 
+        # CRITICAL: Set trainable_module_keys for checkpoint saving
+        # Vision backbone, projector, LLM backbone all have trainable parameters (LoRA adapters + projector)
+        vlm.trainable_module_keys = ["vision_backbone", "projector", "llm_backbone"]
+        overwatch.info(f"Set trainable_module_keys = {vlm.trainable_module_keys}")
+
         # 훈련 가능한 파라미터 출력
         if overwatch.is_rank_zero():
             total_params = sum(p.numel() for p in vlm.parameters())

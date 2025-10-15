@@ -1,4 +1,4 @@
-export CUDA_VISIBLE_DEVICES=3,5,6,7
+export CUDA_VISIBLE_DEVICES=1,2,3,5
 export NCCL_P2P_DISABLE=1
 export NCCL_IB_DISABLE=1
 export NCCL_DEBUG=INFO
@@ -16,8 +16,8 @@ torchrun --nproc_per_node ${GPUS_PER_NODE} --nnodes ${NNODES} --node_rank ${RANK
                                     --lora_rank 32 \
                                     --lora_dropout 0.0 \
                                     --lora_vision true \
-                                    --lora_vision_target "attn" \
-                                    --lora_target "attn" \
+                                    --lora_vision_target "attn_mlp" \
+                                    --lora_target "attn_mlp" \
                                     --dataset_name "libero_combined" \
                                     --window_size 16 \
                                     --lam_path "/ssd1/UniVLA/latent_action_model/logs/task_centric_lam_stage2/epoch=2-step=18000.ckpt" \
@@ -30,4 +30,4 @@ torchrun --nproc_per_node ${GPUS_PER_NODE} --nnodes ${NNODES} --node_rank ${RANK
                                     --gradient_accumulation_steps 1 \
                                     --vla.enable_mixed_precision_training true \
                                     --vla.enable_gradient_checkpointing true \
-                                    --save_interval 2000 \
+                                    --save_interval 200 \

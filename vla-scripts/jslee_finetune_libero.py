@@ -15,8 +15,6 @@ from peft import PeftModel
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim import AdamW
 from torch.utils.data import DataLoader
-from transformers import AutoModelForVision2Seq, AutoProcessor
-from transformers import AutoConfig, AutoImageProcessor
 
 import wandb
 from prismatic.models.backbones.llm.prompting import PurePromptBuilder, VicunaV15ChatPromptBuilder
@@ -24,10 +22,6 @@ from prismatic.util.data_utils import PaddedCollatorForActionPrediction_LIBERO
 from prismatic.vla.action_tokenizer import ActionTokenizer
 from prismatic.vla.datasets import RLDSBatchTransformLIBERO_withHis, RLDSDataset
 from prismatic.vla.datasets.rlds.utils.data_utils import save_dataset_statistics
-
-from prismatic.extern.hf.configuration_prismatic import OpenVLAConfig
-from prismatic.extern.hf.modeling_prismatic import OpenVLAForActionPrediction
-from prismatic.extern.hf.processing_prismatic import PrismaticImageProcessor, PrismaticProcessor
 
 # Sane Defaults
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -62,6 +56,14 @@ class Wrapped_Model(torch.nn.Module):
         self.window_size = window_size
         self.action_decoder = ActionDecoder(window_size=window_size)
 
+        # Detect Vision backbone structure and get num_patches
+        if hasattr(vla.vision_backbone, 'dino_featurizer'):
+            self.num_patches = vla.vision_backbone.dino_featurizer.patch_embed.num_patches
+        elif hasattr(vla.vision_backbone, 'featurizer'):
+            self.num_patches = vla.vision_backbone.featurizer.patch_embed.num_patches
+        else:
+            raise ValueError("Unknown vision backbone structure!")
+
         if freeze_vla:
             self.vla.requires_grad_(False)
 
@@ -79,8 +81,8 @@ class Wrapped_Model(torch.nn.Module):
         return vla_output, loss, loss_one_step, latent_action_tokens
 
     def action_decoder_forward(self, batch, vla_output):
-        visual_embed = vla_output.hidden_states[-1][:, : self.vla.vision_backbone.featurizer.patch_embed.num_patches ].to(torch.float)
-        latent_tokens = vla_output.hidden_states[-1][:, self.vla.vision_backbone.featurizer.patch_embed.num_patches : ]
+        visual_embed = vla_output.hidden_states[-1][:, : self.num_patches ].to(torch.float)
+        latent_tokens = vla_output.hidden_states[-1][:, self.num_patches : ]
         action_gt = batch["labels"].to(latent_tokens.device)
         mask = action_gt > 32000
 
@@ -102,8 +104,8 @@ class Wrapped_Model(torch.nn.Module):
 @dataclass
 class FinetuneConfig:
     # fmt: off
-    vla_path: str = "/path/to/your/base-vla"                        # Path to base VLA model (without LoRA)
-    lora_pretrained_path: str = "/path/to/your/lora-checkpoint"     # Path to LoRA pre-trained checkpoint directory
+    vla_model_id: str = "prism-dinosiglip-224px+7b"                 # Base VLA model ID (Prismatic format)
+    lora_pretrained_path: str = "/path/to/your/lora-checkpoint.pt"  # Path to LoRA pre-trained checkpoint (.pt file)
     lam_path: str = "latent_action_model/logs/task_centric_lam_stage2/epoch=0-step=200000.ckpt"
 
     # Directory Paths
@@ -111,6 +113,10 @@ class FinetuneConfig:
     dataset_name: str = "libero_spatial_no_noops"                   # Name of fine-tuning dataset (e.g., `droid_wipe`)
     run_root_dir: Path = Path("runs")                               # Path to directory to store logs & checkpoints
     adapter_tmp_dir: Path = Path("adapter-tmp")                     # Temporary directory for LoRA weights before fusing
+
+    # HuggingFace settings
+    hf_token: Optional[str] = None
+    hf_cache_dir: Path = Path("ssd2/hf_cache")
 
     # LoRA Fine-tuning Settings
     freeze_base_model: bool = True                                  # Whether to freeze base VLA parameters
@@ -142,6 +148,7 @@ class FinetuneConfig:
     use_lora: bool = True                                           # Always True for this script
     lora_rank: int = 32                                             # Should match pre-trained LoRA rank
     lora_dropout: float = 0.0                                       # Should match pre-trained LoRA dropout
+    lora_target: str = "attn"                                       # LLM LoRA target: "attn" or "attn_mlp"
     use_quantization: bool = False                                  # Not recommended for LoRA fine-tuning
 
     # Vision LoRA Arguments (should match jslee_train_lora.py config)
@@ -158,6 +165,7 @@ class FinetuneConfig:
 @draccus.wrap()
 def finetune(cfg: FinetuneConfig) -> None:
     print(f"Fine-tuning LoRA Model from `{cfg.lora_pretrained_path}` on `{cfg.dataset_name}`")
+    print(f"Base VLA model: {cfg.vla_model_id}")
     print(f"Vision LoRA enabled: {cfg.lora_vision} (target: {cfg.lora_vision_target})")
     print(f"LoRA config: rank={cfg.lora_rank}, dropout={cfg.lora_dropout}")
 
@@ -196,108 +204,249 @@ def finetune(cfg: FinetuneConfig) -> None:
     run_dir, adapter_dir = cfg.run_root_dir / exp_id, cfg.adapter_tmp_dir / exp_id
     os.makedirs(run_dir, exist_ok=True)
 
-    # Register OpenVLA model to HF Auto Classes (not needed if the model is on HF Hub)
-    AutoConfig.register("openvla", OpenVLAConfig)
-    AutoImageProcessor.register(OpenVLAConfig, PrismaticImageProcessor)
-    AutoProcessor.register(OpenVLAConfig, PrismaticProcessor)
-    AutoModelForVision2Seq.register(OpenVLAConfig, OpenVLAForActionPrediction)
+    # Setup HF token and cache
+    hf_token = cfg.hf_token or os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_HUB_TOKEN")
+    os.environ.setdefault("HF_HOME", str(cfg.hf_cache_dir))
+    os.environ.setdefault("TRANSFORMERS_CACHE", str(cfg.hf_cache_dir))
 
-    # Load OpenVLA Processor
-    processor = AutoProcessor.from_pretrained(cfg.vla_path, trust_remote_code=True)
+    # Load Base VLA Model using Prismatic native loader
+    print(f"Loading base VLA model `{cfg.vla_model_id}` using Prismatic loader...")
+    from prismatic.models import load
 
-    print("Loading base VLA model...")
-    # Load Base VLA Model (without LoRA)
-    base_vla = AutoModelForVision2Seq.from_pretrained(
-        cfg.vla_path,
-        torch_dtype=torch.bfloat16,
-        low_cpu_mem_usage=True,
-        trust_remote_code=True,
-    ).to(device_id)
+    vla = load(
+        cfg.vla_model_id,
+        hf_token=hf_token,
+        load_for_training=True,
+        cache_dir=str(cfg.hf_cache_dir)
+    )
 
-    print("Loading pre-trained LoRA adapters...")
+    # Get processor/tokenizer
+    processor = vla.llm_backbone.tokenizer
 
-    # Check if using new PEFT format (with separate LLM and Vision LoRA)
-    lora_path = Path(cfg.lora_pretrained_path)
-    llm_lora_path = lora_path / "llm_lora"
-    vision_lora_path = lora_path / "vision_lora"
-    projector_path = lora_path / "projector.pt"
+    print(f"✅ Base VLA model loaded successfully")
 
-    if llm_lora_path.exists():
-        print(f"  Detected new PEFT format at {cfg.lora_pretrained_path}")
+    # IMPORTANT: Add action tokens BEFORE applying LoRA
+    # This ensures vocab size matches the checkpoint (32017)
+    print(f"\n" + "=" * 80)
+    print("Adding Action Tokens to Tokenizer")
+    print("=" * 80)
 
-        # Load LLM LoRA adapters
-        print(f"  Loading LLM LoRA from {llm_lora_path}...")
-        from peft import PeftModel
-        base_vla.language_model = PeftModel.from_pretrained(base_vla.language_model, str(llm_lora_path))
-        print("  ✅ LLM LoRA loaded")
+    def _build_action_tokenizer_and_resize(vlm, codebook_size: int) -> ActionTokenizer:
+        """Add action tokens and resize embeddings (copied from jslee_train_lora.py)"""
+        tok = vlm.llm_backbone.get_tokenizer()
+        special_tokens = {"additional_special_tokens": [f"<ACT_{i}>" for i in range(codebook_size)]}
+        tok.add_special_tokens(special_tokens)
+        # Resize token embeddings BEFORE PEFT to match checkpoint
+        vlm.llm_backbone.llm.resize_token_embeddings(len(tok))
+        return ActionTokenizer(tok)
 
-        # Load Vision LoRA adapters if present
-        if cfg.lora_vision and vision_lora_path.exists():
-            print(f"  Loading Vision LoRA from {vision_lora_path}...")
+    action_tokenizer = _build_action_tokenizer_and_resize(vla, cfg.codebook_size)
+    print(f"✅ Added {cfg.codebook_size} action tokens")
+    print(f"   New vocabulary size: {len(processor)}")
 
-            # Check for dual featurizers (DinoSigLIP) or single featurizer
-            dino_lora_path = vision_lora_path / "dino"
-            siglip_lora_path = vision_lora_path / "siglip"
+    # Load LoRA checkpoint (.pt file)
+    print(f"\nLoading LoRA checkpoint from {cfg.lora_pretrained_path}...")
+    checkpoint = torch.load(cfg.lora_pretrained_path, map_location="cpu")
 
-            if dino_lora_path.exists() and siglip_lora_path.exists():
-                print("    Loading DINOv2 LoRA...")
-                base_vla.vision_backbone.dino_featurizer = PeftModel.from_pretrained(
-                    base_vla.vision_backbone.dino_featurizer, str(dino_lora_path)
-                )
-                print("    ✅ DINOv2 LoRA loaded")
-
-                print("    Loading SigLIP LoRA...")
-                base_vla.vision_backbone.siglip_featurizer = PeftModel.from_pretrained(
-                    base_vla.vision_backbone.siglip_featurizer, str(siglip_lora_path)
-                )
-                print("    ✅ SigLIP LoRA loaded")
-            elif vision_lora_path.exists():
-                print("    Loading single featurizer LoRA...")
-                base_vla.vision_backbone.featurizer = PeftModel.from_pretrained(
-                    base_vla.vision_backbone.featurizer, str(vision_lora_path)
-                )
-                print("    ✅ Vision LoRA loaded")
-
-        # Load projector weights
-        if projector_path.exists():
-            print(f"  Loading projector from {projector_path}...")
-            base_vla.projector.load_state_dict(torch.load(projector_path, map_location=device_id))
-            print("  ✅ Projector loaded")
-
-        vla = base_vla
+    if "model" in checkpoint:
+        state_dict = checkpoint["model"]
+        print(f"  Checkpoint contains {len(state_dict)} keys")
     else:
-        # Legacy format: single PEFT adapter (LLM only)
-        print(f"  Detected legacy PEFT format at {cfg.lora_pretrained_path}")
-        print(f"  Loading LLM LoRA adapters...")
-        vla = PeftModel.from_pretrained(base_vla, cfg.lora_pretrained_path)
-        print("  ⚠️  Note: Vision LoRA not loaded (legacy format)")
+        raise ValueError("Checkpoint does not contain 'model' key!")
 
-    # Verify Vision LoRA loading
-    if cfg.lora_vision and distributed_state.is_main_process:
-        print("\n🔍 Checking Vision LoRA loading...")
-        vision_lora_modules = []
-        vision_conv2d_lora_modules = []
+    # Apply LoRA to LLM
+    print("\n" + "=" * 80)
+    print("Applying LoRA to LLM Backbone")
+    print("=" * 80)
 
-        # Check for Vision LoRA modules
-        for name, module in vla.named_modules():
-            if 'vision_backbone' in name and (hasattr(module, 'lora_A') or 'lora_' in str(type(module))):
-                vision_lora_modules.append(name)
-                if 'patch_embed' in name:
-                    vision_conv2d_lora_modules.append(name)
-                    print(f"  ❌ CRITICAL: Conv2D LoRA detected: {name}")
-                else:
-                    print(f"  ✅ Vision LoRA loaded: {name}")
+    from peft import LoraConfig, get_peft_model, TaskType
 
-        print(f"Total Vision LoRA modules found: {len(vision_lora_modules)}")
-        if vision_conv2d_lora_modules:
-            print(f"⚠️  WARNING: {len(vision_conv2d_lora_modules)} Conv2D LoRA modules found!")
-        else:
-            print("✅ No Conv2D LoRA modules found")
+    if cfg.lora_target == "attn":
+        target_modules_llm = ["q_proj", "k_proj", "v_proj", "o_proj"]
+    elif cfg.lora_target == "attn_mlp":
+        target_modules_llm = ["q_proj", "k_proj", "v_proj", "o_proj",
+                              "gate_proj", "up_proj", "down_proj"]
+    else:
+        raise ValueError(f"Unsupported lora_target={cfg.lora_target}")
 
-    # Print model info
+    lora_config_llm = LoraConfig(
+        r=cfg.lora_rank,
+        lora_alpha=min(cfg.lora_rank, 16),
+        lora_dropout=cfg.lora_dropout,
+        target_modules=target_modules_llm,
+        task_type=TaskType.CAUSAL_LM,
+        bias="none",
+    )
+
+    print(f"Applying PEFT to LLM with target modules: {target_modules_llm}")
+    vla.llm_backbone.llm = get_peft_model(vla.llm_backbone.llm, lora_config_llm)
+    print("✅ LLM LoRA structure applied")
+    
+    # TODO jslee add for saving GPU memory
+    if hasattr(vla.llm_backbone.llm, 'gradient_checkpointing_enable'):
+        vla.llm_backbone.llm.gradient_checkpointing_enable()
+        
+
     if distributed_state.is_main_process:
-        print("\n=== LoRA Model Information ===")
-        vla.print_trainable_parameters()
+        vla.llm_backbone.llm.print_trainable_parameters()
+
+    # Load LLM LoRA weights from checkpoint
+    print("\nLoading LLM LoRA weights from checkpoint...")
+    if "llm_backbone" in state_dict:
+        llm_state = state_dict["llm_backbone"]
+        # Remove "llm." prefix if present (from DDP wrapper)
+        llm_state_cleaned = {}
+        for k, v in llm_state.items():
+            if k.startswith("llm."):
+                llm_state_cleaned[k[4:]] = v
+            else:
+                llm_state_cleaned[k] = v
+
+        # Load into language_model
+        missing, unexpected = vla.llm_backbone.llm.load_state_dict(llm_state_cleaned, strict=False)
+        print(f"  Missing keys: {len(missing)} (expected for non-LoRA params)")
+        print(f"  Unexpected keys: {len(unexpected)}")
+        if unexpected:
+            print(f"    Unexpected: {unexpected[:5]}...")
+    else:
+        print("  ⚠️  Warning: 'llm_backbone' not found in checkpoint!")
+
+    # Apply Vision LoRA (reusing logic from jslee_train_lora.py)
+    if cfg.use_lora and cfg.lora_vision:
+        print("\n" + "=" * 80)
+        print(f"Applying Vision LoRA with target={cfg.lora_vision_target}")
+        print("=" * 80)
+
+        # Extract vision target modules dynamically
+        def _extract_common_attention_mlp_patterns(featurizer, featurizer_name):
+            """Extract attention/MLP module names from vision backbone."""
+            attention_modules = []
+            mlp_modules = []
+
+            for name, module in featurizer.named_modules():
+                # Skip patch_embed
+                if 'patch_embed' in name:
+                    continue
+
+                # Check for transformer blocks
+                if 'blocks.' in name:
+                    if 'attn' in name and not ('norm' in name or 'drop' in name):
+                        if hasattr(module, 'weight') and len(module.weight.shape) == 2:
+                            attention_modules.append(name)
+                    elif 'mlp' in name and not ('norm' in name or 'drop' in name):
+                        if hasattr(module, 'weight') and len(module.weight.shape) == 2:
+                            mlp_modules.append(name)
+
+            print(f"  {featurizer_name} extracted - Attn: {len(attention_modules)}, MLP: {len(mlp_modules)}")
+            return attention_modules, mlp_modules
+
+        # Extract from both featurizers
+        dino_attn, dino_mlp = _extract_common_attention_mlp_patterns(
+            vla.vision_backbone.dino_featurizer, "DINOv2"
+        )
+        siglip_attn, siglip_mlp = _extract_common_attention_mlp_patterns(
+            vla.vision_backbone.siglip_featurizer, "SigLIP"
+        )
+
+        # Target modules based on config
+        if cfg.lora_vision_target == "attn":
+            target_modules_vision = list(set(dino_attn + siglip_attn))
+        elif cfg.lora_vision_target == "attn_mlp":
+            target_modules_vision = list(set(dino_attn + dino_mlp + siglip_attn + siglip_mlp))
+        else:
+            raise ValueError(f"Unsupported lora_vision_target={cfg.lora_vision_target}")
+
+        print(f"Vision LoRA target modules: {len(target_modules_vision)} modules dynamically identified")
+
+        vision_lora_config = LoraConfig(
+            r=cfg.lora_rank,
+            lora_alpha=min(cfg.lora_rank, 16),
+            lora_dropout=cfg.lora_dropout,
+            target_modules=target_modules_vision,
+            task_type=TaskType.FEATURE_EXTRACTION,
+            bias="none",
+        )
+
+        # Apply to featurizers with monkey-patch compatibility
+        from functools import partial
+        from prismatic.models.backbones.vision.base_vision import unpack_tuple
+
+        def _apply_vision_lora_with_compat(featurizer, config, name):
+            """PEFT와 monkey-patched forward를 호환시키는 래퍼"""
+            print(f"\n🔧 Applying LoRA to {name} featurizer")
+
+            # PEFT 적용 전에 forward 메소드를 원래대로 되돌림
+            if hasattr(featurizer, '_original_forward'):
+                print(f"  Restoring from backup _original_forward")
+                featurizer.forward = featurizer._original_forward
+            else:
+                print(f"  Creating backup of original forward method")
+                featurizer._original_forward = featurizer.__class__.forward.__get__(featurizer, featurizer.__class__)
+                featurizer.forward = featurizer._original_forward
+
+            # PEFT 적용
+            print(f"  Applying PEFT LoRA...")
+            peft_featurizer = get_peft_model(featurizer, config)
+
+            # monkey-patch를 다시 적용
+            print(f"  Re-applying monkey-patch for intermediate layers...")
+            peft_featurizer.forward = unpack_tuple(
+                partial(peft_featurizer.get_intermediate_layers, n={len(peft_featurizer.blocks) - 2})
+            )
+
+            print(f"  ✅ Applied Vision LoRA to {name}")
+            return peft_featurizer
+
+        # Apply to both featurizers
+        vla.vision_backbone.dino_featurizer = _apply_vision_lora_with_compat(
+            vla.vision_backbone.dino_featurizer, vision_lora_config, "DINOv2"
+        )
+        vla.vision_backbone.siglip_featurizer = _apply_vision_lora_with_compat(
+            vla.vision_backbone.siglip_featurizer, vision_lora_config, "SigLIP"
+        )
+
+        if distributed_state.is_main_process:
+            print("\n=== DINOv2 LoRA Parameters ===")
+            vla.vision_backbone.dino_featurizer.print_trainable_parameters()
+            print("\n=== SigLIP LoRA Parameters ===")
+            vla.vision_backbone.siglip_featurizer.print_trainable_parameters()
+
+        # Load Vision LoRA weights from checkpoint
+        print("\nLoading Vision LoRA weights from checkpoint...")
+        if "vision_backbone" in state_dict:
+            vision_state = state_dict["vision_backbone"]
+
+            # Separate dino and siglip states
+            dino_state = {k[len("dino_featurizer."):]: v for k, v in vision_state.items()
+                          if k.startswith("dino_featurizer.")}
+            siglip_state = {k[len("siglip_featurizer."):]: v for k, v in vision_state.items()
+                            if k.startswith("siglip_featurizer.")}
+
+            print(f"  Loading DINOv2 weights: {len(dino_state)} keys")
+            missing_dino, unexpected_dino = vla.vision_backbone.dino_featurizer.load_state_dict(
+                dino_state, strict=False
+            )
+            print(f"    Missing: {len(missing_dino)}, Unexpected: {len(unexpected_dino)}")
+
+            print(f"  Loading SigLIP weights: {len(siglip_state)} keys")
+            missing_siglip, unexpected_siglip = vla.vision_backbone.siglip_featurizer.load_state_dict(
+                siglip_state, strict=False
+            )
+            print(f"    Missing: {len(missing_siglip)}, Unexpected: {len(unexpected_siglip)}")
+        else:
+            print("  ⚠️  Warning: 'vision_backbone' not found in checkpoint!")
+
+    # Load Projector weights
+    print("\n" + "=" * 80)
+    print("Loading Projector Weights")
+    print("=" * 80)
+    if "projector" in state_dict:
+        projector_state = state_dict["projector"]
+        missing, unexpected = vla.projector.load_state_dict(projector_state, strict=True)
+        print(f"  ✅ Projector weights loaded successfully")
+        print(f"    Missing: {len(missing)}, Unexpected: {len(unexpected)}")
+    else:
+        print("  ⚠️  Warning: 'projector' not found in checkpoint!")
 
     # Apply selective freezing for LoRA-only training
     if cfg.freeze_base_model and cfg.lora_only_training:
@@ -307,31 +456,38 @@ def finetune(cfg: FinetuneConfig) -> None:
         if cfg.lora_vision:
             print("  - Vision LoRA adapters: TRAINABLE")
 
-        # Freeze all base model parameters
-        for param in vla.base_model.parameters():
-            param.requires_grad = False
-
-        # Ensure all LoRA parameters (LLM + Vision) are trainable
+        # Freeze all non-LoRA parameters
         llm_lora_count = 0
         vision_lora_count = 0
+        projector_count = 0
+
         for name, param in vla.named_parameters():
             if 'lora_' in name:
+                # LoRA parameters should be trainable
                 param.requires_grad = True
                 if 'vision_backbone' in name:
                     vision_lora_count += param.numel()
-                    if distributed_state.is_main_process:
+                    if distributed_state.is_main_process and vision_lora_count <= 10:  # Log first few
                         print(f"  ✅ Vision LoRA trainable: {name}")
-                else:
+                elif 'llm_backbone' in name:
                     llm_lora_count += param.numel()
-                    if distributed_state.is_main_process:
+                    if distributed_state.is_main_process and llm_lora_count <= 10:  # Log first few
                         print(f"  ✅ LLM LoRA trainable: {name}")
+            elif 'projector' in name:
+                # Projector should be trainable
+                param.requires_grad = True
+                projector_count += param.numel()
+            else:
+                # All other base parameters should be frozen
+                param.requires_grad = False
 
         if distributed_state.is_main_process:
             print(f"\nLoRA Parameters Summary:")
             print(f"  - LLM LoRA parameters: {llm_lora_count:,}")
             if cfg.lora_vision:
                 print(f"  - Vision LoRA parameters: {vision_lora_count:,}")
-            print(f"  - Total LoRA parameters: {llm_lora_count + vision_lora_count:,}")
+            print(f"  - Projector parameters: {projector_count:,}")
+            print(f"  - Total trainable (LoRA + Projector): {llm_lora_count + vision_lora_count + projector_count:,}")
 
     # Create wrapped model with action decoder
     wrapped_model = Wrapped_Model(vla=vla, freeze_vla=cfg.freeze_vla, window_size=cfg.window_size).to(device_id)
@@ -370,8 +526,10 @@ def finetune(cfg: FinetuneConfig) -> None:
                 print(f"  ⚠️  WARNING: Vision LoRA enabled but no trainable Vision LoRA parameters found!")
 
     # Wrap VLA in PyTorch DDP Wrapper for Multi-GPU Training
-    wrapped_model = DDP(wrapped_model, device_ids=[device_id], find_unused_parameters=True, gradient_as_bucket_view=True)
-
+    # TODO jslee mod for saving GPU memory
+    # wrapped_model = DDP(wrapped_model, device_ids=[device_id], find_unused_parameters=True, gradient_as_bucket_view=True)
+    wrapped_model = DDP(wrapped_model, device_ids=[device_id], find_unused_parameters=False, gradient_as_bucket_view=True)
+    
     # Create Optimizer =>> Only for trainable parameters
     trainable_params = [param for param in wrapped_model.parameters() if param.requires_grad]
     optimizer = AdamW(trainable_params, lr=cfg.learning_rate, weight_decay=1e-4)  # Lower weight decay for LoRA
@@ -391,8 +549,9 @@ def finetune(cfg: FinetuneConfig) -> None:
         num_heads=cfg.lam_num_heads,
         dropout=0.,
     )
-
-    lam_ckpt = torch.load(cfg.lam_path)['state_dict']
+    # TODO jslee mod for GPU memory
+    # lam_ckpt = torch.load(cfg.lam_path)['state_dict']
+    lam_ckpt = torch.load(cfg.lam_path, map_location='cpu')['state_dict']   
     new_ckpt = {}
     for key in lam_ckpt.keys():
         new_ckpt[key.replace("lam.", "")] = lam_ckpt[key]
@@ -402,10 +561,10 @@ def finetune(cfg: FinetuneConfig) -> None:
 
     batch_transform = RLDSBatchTransformLIBERO_withHis(
         latent_action_model,
-        processor.tokenizer,
-        image_transform=processor.image_processor.apply_transform,
+        processor,  # processor is tokenizer in Prismatic format
+        image_transform=vla.vision_backbone.get_image_transform(),  # Use Prismatic vision transform
         image_transform_lam=transforms.ToTensor(),
-        prompt_builder_fn=PurePromptBuilder if "v01" not in cfg.vla_path else VicunaV15ChatPromptBuilder,
+        prompt_builder_fn=PurePromptBuilder if "v01" not in cfg.vla_model_id else VicunaV15ChatPromptBuilder,
         window_size=cfg.window_size
     )
 
@@ -414,7 +573,7 @@ def finetune(cfg: FinetuneConfig) -> None:
         cfg.data_root_dir,
         cfg.dataset_name,
         batch_transform,
-        resize_resolution=tuple(wrapped_model.module.vla.config.image_sizes),
+        resize_resolution=vla.vision_backbone.default_image_resolution[1:],  # Prismatic format: (C, H, W) -> (H, W)
         shuffle_buffer_size=cfg.shuffle_buffer_size,
         image_aug=cfg.image_aug,
         window_size=cfg.window_size + 1,        # for constructing history latent actions
@@ -427,7 +586,7 @@ def finetune(cfg: FinetuneConfig) -> None:
 
     # Create Collator and DataLoader
     collator = PaddedCollatorForActionPrediction_LIBERO(
-        processor.tokenizer.model_max_length, processor.tokenizer.pad_token_id, padding_side="right"
+        processor.model_max_length, processor.pad_token_id, padding_side="right"
     )
     dataloader = DataLoader(
         vla_dataset,
@@ -453,7 +612,14 @@ def finetune(cfg: FinetuneConfig) -> None:
             batch["input_ids"] = batch["input_ids"].to(device_id)
             batch["attention_mask"] = batch["attention_mask"].to(device_id)
             batch["labels"] = batch["labels"].to(device_id)
-            batch["pixel_values"] = batch["pixel_values"].to(torch.bfloat16).to(device_id)
+            # TODO jslee mod 
+            if isinstance(batch["pixel_values"], dict):
+                batch["pixel_values"] = {
+                    k: v.to(torch.bfloat16).to(device_id)
+                    for k, v in batch["pixel_values"].items()
+                }
+            else:
+                batch["pixel_values"] = batch["pixel_values"].to(torch.bfloat16).to(device_id)
             batch['actions'] = batch['actions'].to(device_id)
             batch['latent_action_idx'] = batch['latent_action_idx'].to(device_id)
 
@@ -462,7 +628,9 @@ def finetune(cfg: FinetuneConfig) -> None:
 
             # For LoRA-only training, we might want to focus more on action loss
             if cfg.lora_only_training:
-                loss = act_loss  # Focus on action decoder training
+                # loss = act_loss  # Focus on action decoder training
+                # TODO jslee mod for saving GPU memory
+                loss = act_loss + 0 * output.loss            
             else:
                 loss = act_loss + output.loss
 
@@ -474,7 +642,7 @@ def finetune(cfg: FinetuneConfig) -> None:
             normalized_loss.backward()
 
             # Compute Accuracy and L1 Loss for Logging
-            action_logits = output.logits[:, wrapped_model.module.vla.vision_backbone.featurizer.patch_embed.num_patches : -1]
+            action_logits = output.logits[:, wrapped_model.module.num_patches : -1]
             action_preds = action_logits.argmax(dim=2)
             action_gt = batch["labels"][:, 1:].to(action_preds.device)
             mask = action_gt > 32000
@@ -524,17 +692,30 @@ def finetune(cfg: FinetuneConfig) -> None:
                         adapter_save_dir = adapter_dir / f"step_{gradient_step_idx}"
                         os.makedirs(adapter_save_dir, exist_ok=True)
 
-                        # Save LoRA adapters
-                        wrapped_model.module.vla.save_pretrained(adapter_save_dir)
-                        processor.save_pretrained(adapter_save_dir)
+                        # Save checkpoint in Prismatic .pt format (compatible with jslee_train_lora.py)
+                        checkpoint_data = {
+                            "model": {
+                                "llm_backbone": wrapped_model.module.vla.llm_backbone.state_dict(),
+                                "vision_backbone": wrapped_model.module.vla.vision_backbone.state_dict(),
+                                "projector": wrapped_model.module.vla.projector.state_dict(),
+                            },
+                            "step": gradient_step_idx,
+                        }
+                        checkpoint_path = adapter_save_dir / f"checkpoint-step-{gradient_step_idx}.pt"
+                        torch.save(checkpoint_data, checkpoint_path)
+                        print(f"  Saved LoRA checkpoint (.pt format) to: {checkpoint_path}")
 
-                        print(f"Saved LoRA adapters to: {adapter_save_dir}")
+                        # Save tokenizer
+                        processor.save_pretrained(adapter_save_dir)
+                        print(f"  Saved tokenizer to: {adapter_save_dir}")
 
                     # Save action decoder
+                    action_decoder_path = run_dir / f'action_decoder-{gradient_step_idx}.pt'
                     torch.save(
                         wrapped_model.module.action_decoder.state_dict(),
-                        str(run_dir) + f'/action_decoder-{gradient_step_idx}.pt'
+                        action_decoder_path
                     )
+                    print(f"  Saved action decoder to: {action_decoder_path}")
 
                 # Wait for main process to save
                 dist.barrier()
